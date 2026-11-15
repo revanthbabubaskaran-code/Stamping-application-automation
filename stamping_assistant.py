@@ -691,7 +691,7 @@ class PortalWorker(threading.Thread):
             # Prefer native accessible label matching.
             loc = page.get_by_label(re.compile(re.escape(name), re.I)).first
             try:
-                if loc.count():
+                if loc.count() and loc.is_visible():
                     return loc
             except Exception:
                 pass
@@ -702,13 +702,43 @@ class PortalWorker(threading.Thread):
                 if any(self._norm(n) == text or self._norm(n) in text for n in names):
                     target_id = label.get_attribute("for")
                     if target_id:
-                        return page.locator(f"#{target_id}")
+                        target = page.locator(f"#{target_id}")
+                        if target.count() and target.first.is_visible():
+                            return target.first
                     nested = label.locator("input,select,textarea").first
-                    if nested.count():
+                    if nested.count() and nested.is_visible():
                         return nested
             except Exception:
                 continue
         return None
+
+    def _portal_field(self, field):
+        """Prefer a visible known ID, then fall back to the portal's visible label."""
+        selector = PORTAL_IDS.get(field)
+        if selector:
+            direct = self.page.locator(selector)
+            try:
+                if direct.count() and direct.first.is_visible():
+                    return direct.first
+            except Exception:
+                pass
+        return self._field_for(FIELD_LABELS.get(field, [field]))
+
+    @staticmethod
+    def _field_value_matches(locator, expected):
+        try:
+            actual = locator.input_value().strip()
+            input_type = (locator.get_attribute("type") or "").lower()
+        except Exception:
+            return False
+        expected = str(expected).strip()
+        if input_type == "date":
+            date_match = re.fullmatch(r"(\d{1,2})[-/](\d{1,2})[-/](\d{4})", expected)
+            if date_match:
+                day, month, year = date_match.groups()
+                expected = f"{year}-{int(month):02d}-{int(day):02d}"
+        compact = lambda value: re.sub(r"[^a-z0-9]", "", value.lower())
+        return bool(actual) and compact(actual) == compact(expected)
 
     def _fill_form(self, payload):
         self._navigate_to_stamping_form()
@@ -779,7 +809,7 @@ class PortalWorker(threading.Thread):
         for field, value in fields.items():
             if not value or field in excluded:
                 continue
-            locator = page.locator(PORTAL_IDS[field]) if field in PORTAL_IDS else self._field_for(FIELD_LABELS.get(field, [field]))
+            locator = self._portal_field(field)
             try:
                 if locator is None or not locator.count() or not locator.first.is_visible():
                     report["skipped"].append(f"{field} (control not found or not visible)")
@@ -943,6 +973,9 @@ class PortalWorker(threading.Thread):
                     page.wait_for_timeout(1400)
                 elif field in {"State", "District", "Taluk", "Town / Village", "Street"}:
                     page.wait_for_timeout(1200 if field in {"District", "Taluk"} else 700)
+                if field in {"Repairer licence number", "Previous CV number", "Previous CV date"} and not self._field_value_matches(locator, value):
+                    report["skipped"].append(f"{field} (portal value did not persist after filling)")
+                    continue
                 report["filled"].append(field)
             except Exception as exc:
                 report["skipped"].append(f"{field}: {exc}")
