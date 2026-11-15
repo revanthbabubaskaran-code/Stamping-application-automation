@@ -23,7 +23,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\build.ps1
 ```
 
-The executable will be created at `dist\TN_Stamping_Assistant_v19.exe`. The build script downloads Python packages into `.build-deps`, downloads Chromium into `.pw-browsers`, and bundles both with PyInstaller.
+The executable will be created at `dist\TN_Stamping_Assistant_v20.exe`. The build script downloads Python packages into `.build-deps`, downloads Chromium into `.pw-browsers`, and bundles both with PyInstaller.
 
 To run from source instead:
 
@@ -38,9 +38,9 @@ python stamping_assistant.py
 2. Add the Previous CV PDF and owner authorisation letter in the **Documents** section directly below sign-in. The selected account's PAN image is uploaded automatically.
 3. Choose **Read PDF and fill draft**. Review applicant and address values, then check each machine row. The app lists page count and footer-only pages ignored. It uses the first page's CV number/date for the first-page fields and preserves each page's CV/application number for the Previous Information rows.
 4. Choose **Start application** to open bundled Chromium and fill the saved login. Complete the CAPTCHA manually. If no PDF draft is ready yet, choose **Fill now / retry** after signing in.
-5. With a reviewed PDF draft ready, choose **Start application** to continue automatically after login, or **Fill now / retry** to resume the current page. The app fills the Establishment Details and Manufacturer/Trader details, selects the matching item types and quantities, fills Previous Information, then fills the detailed machine rows and advances to the final review page.
+5. With a reviewed PDF draft ready, choose **Start application** to continue automatically after login, or **Fill now / retry** to resume the current page. On the first portal page, fields are filled in their visible top-to-bottom order, waiting for dependent location lists and license details before continuing. The app then fills item types and quantities, Previous Information, and machine-detail rows in page order. It advances only when the visible required fields are filled and verifies a Submit control is present on the final review page.
 6. Check the portal pages. The app selects **Other** for mixed instrument types, **Re-verification** as the stamping purpose, **Repairer** as the licensed applicant type, and sets site Dormant/Other from the additional-fee value on the certificate. It selects the 3-tonne capacity option only for an Electronic choice.
-7. Press **Submit application** and confirm after reviewing the final portal page. Payment remains manual. **Fill now / retry** resumes the current portal step if a page needs attention.
+7. Press **Submit application** and confirm after reviewing the final portal page. The app only clicks a visible, enabled portal Submit control; it reports a clear message if the portal has not reached that page. Payment remains manual. **Fill now / retry** resumes the current portal step if a page needs attention.
 
 Use the mouse wheel or the vertical scrollbar to navigate the application UI. The colors follow the Windows app theme and update when Windows switches between light and dark mode.
 

@@ -358,7 +358,8 @@ class PortalWorker(threading.Thread):
                 return
             context = browser.new_context()
             self.page = context.new_page()
-            self.page.set_default_timeout(3500)
+            self.page.set_default_timeout(9000)
+            self.page.set_default_navigation_timeout(20000)
             self.ready.set()
             while True:
                 try:
@@ -387,6 +388,8 @@ class PortalWorker(threading.Thread):
                             self.messages.put(("details", report))
                             if report["required_blank"]:
                                 self.messages.put(("error", "The form is filled, but required fields remain blank. Complete those fields in the app browser; the application was not submitted."))
+                            elif not report.get("final_submit_visible"):
+                                self.messages.put(("error", "The portal did not reach a page with a visible Submit control. Review the fields reported as skipped, then use Fill now / retry; nothing was submitted."))
                             else:
                                 self.ready_for_submit = True
                                 self.messages.put(("ready_to_submit", "The application pages are filled through the final review page. Review them in the app browser, then use Submit to complete the application."))
@@ -413,8 +416,11 @@ class PortalWorker(threading.Thread):
                             self.messages.put(("opened", "Portal opened in bundled Chromium. Enter the CAPTCHA; login and application filling will continue automatically."))
                         else:
                             report = self._fill_form(payload)
+                            self.messages.put(("details", report))
                             if report["required_blank"]:
                                 self.messages.put(("error", "The form is filled, but required fields remain blank. Complete those fields in the app browser; the application was not submitted."))
+                            elif not report.get("final_submit_visible"):
+                                self.messages.put(("error", "The portal did not reach a page with a visible Submit control. Review the fields reported as skipped, then use Fill now / retry; nothing was submitted."))
                             else:
                                 self.ready_for_submit = True
                                 self.messages.put(("ready_to_submit", "The application pages are filled through the final review page. Review them in the app browser, then use Submit to complete the application."))
@@ -723,6 +729,7 @@ class PortalWorker(threading.Thread):
             self._click_next("final application page")
             self.workflow_step = 3
         self._collect_visible_required(report)
+        report["final_submit_visible"] = self._find_visible_submit() is not None
         return report
 
     @staticmethod
@@ -743,60 +750,95 @@ class PortalWorker(threading.Thread):
 
     def _fill_establishment_page(self, fields, machines, payload, report):
         page = self.page
-        address_order = ["State", "District", "Taluk", "Town / Village", "Street"]
-        deferred = set(address_order + ["Door number", "Pincode"])
-        for field, value in fields.items():
-            if not value or field in LOCAL_ONLY_FIELDS or field in deferred or field in {"Instrument description", "Applicant business name"}:
-                continue
-            locator = page.locator(PORTAL_IDS[field]) if field in PORTAL_IDS else self._field_for(FIELD_LABELS.get(field, [field]))
-            if locator is None:
-                report["skipped"].append(field)
-                continue
+        # Make the dependent machine type visible first, then order every visible
+        # first-page field by its actual top-to-bottom position in the portal DOM.
+        machine_kinds = {
+            "Electronic" if "electronic" in row.get("Instrument description", "").lower()
+            else "Mechanical" if "mechanical" in row.get("Instrument description", "").lower()
+            else "Other"
+            for row in machines if row.get("Instrument description")
+        }
+        new_goods_choice = next(iter(machine_kinds)) if len(machine_kinds) == 1 else "Other"
+        new_goods = page.locator("#newgood")
+        if new_goods.count():
             try:
-                if field in {"Registered name", "Registered email", "Registered mobile", "Applicant contact name", "Repairer licence date"}:
-                    if locator.evaluate("el => !!el.value"):
-                        continue
-                tag = locator.evaluate("el => el.tagName.toLowerCase()")
-                if tag == "select":
-                    if not self._select_best(locator, value):
-                        report["skipped"].append(field)
-                        continue
+                if not self._select_best(new_goods, new_goods_choice):
+                    report["skipped"].append("New goods / machine type choice")
                 else:
-                    locator.fill(value)
-                if field == "Repairer licence number":
-                    page.wait_for_timeout(1200)
-                report["filled"].append(field)
-            except Exception:
-                report["skipped"].append(field)
+                    page.wait_for_timeout(350)
+            except Exception as exc:
+                report["skipped"].append(f"New goods / machine type choice: {exc}")
+        else:
+            report["skipped"].append("New goods / machine type choice (control not found)")
 
-        for field in address_order + ["Door number", "Pincode"]:
-            value = fields.get(field, "")
-            if not value:
+        electronic_max = max((self._capacity_kg(row.get("Maximum capacity", "")) for row in machines if "electronic" in row.get("Instrument description", "").lower()), default=0)
+        capacity_choice = "Above 3 tonnes" if electronic_max > 3000 else "Below 3 tonnes"
+        actions = []
+        excluded = set(LOCAL_ONLY_FIELDS) | {"Applicant business name", "Used by / trader contact"}
+        for field, value in fields.items():
+            if not value or field in excluded:
                 continue
             locator = page.locator(PORTAL_IDS[field]) if field in PORTAL_IDS else self._field_for(FIELD_LABELS.get(field, [field]))
-            if locator is None:
-                report["skipped"].append(field)
-                continue
             try:
-                selected = self._select_best(locator, value) if locator.evaluate("el => el.tagName.toLowerCase()") == "select" else False
-                if locator.evaluate("el => el.tagName.toLowerCase()") == "select" and not selected:
-                    deadline = time.monotonic() + 10
-                    while time.monotonic() < deadline and not selected:
-                        page.wait_for_timeout(300)
-                        selected = self._select_best(locator, value)
-                elif locator.evaluate("el => el.tagName.toLowerCase()") != "select":
-                    locator.fill(value)
-                    selected = True
-                if not selected:
-                    report["skipped"].append(field)
+                if locator is None or not locator.count() or not locator.first.is_visible():
+                    report["skipped"].append(f"{field} (control not found or not visible)")
                     continue
-                report["filled"].append(field)
-                if field in {"State", "District", "Taluk", "Town / Village", "Street"}:
-                    page.wait_for_timeout(650)
-            except Exception:
-                report["skipped"].append(field)
+                top = locator.first.evaluate("el => el.getBoundingClientRect().top")
+                actions.append((float(top), field, locator.first, value))
+            except Exception as exc:
+                report["skipped"].append(f"{field} (could not locate control: {exc})")
 
-        self._check_same_details()
+        special_choices = [
+            ("Stamping purpose: Re-verification", "#stamping-intend", "Re-verification"),
+            ("Applicant licence type: Repairer", "#applicant-licence-id", "Repairer"),
+        ]
+        if new_goods_choice == "Electronic":
+            special_choices.append(("Weighing machine capacity range", "#tonnes", capacity_choice))
+        for label, selector, value in special_choices:
+            locator = page.locator(selector)
+            try:
+                if locator.count() and locator.first.is_visible():
+                    top = locator.first.evaluate("el => el.getBoundingClientRect().top")
+                    actions.append((float(top), label, locator.first, value))
+                else:
+                    report["skipped"].append(f"{label} (control not found or not visible)")
+            except Exception as exc:
+                report["skipped"].append(f"{label} (could not locate control: {exc})")
+
+        for _top, field, locator, value in sorted(actions, key=lambda action: action[0]):
+            try:
+                if locator.evaluate("el => el.tagName.toLowerCase()") == "select":
+                    selected = self._select_best(locator, value)
+                    if not selected and field in {"District", "Taluk", "Town / Village", "Street", "Weighing machine capacity range"}:
+                        deadline = time.monotonic() + 12
+                        while time.monotonic() < deadline and not selected:
+                            page.wait_for_timeout(300)
+                            if locator.is_enabled():
+                                selected = self._select_best(locator, value)
+                    if not selected:
+                        report["skipped"].append(f"{field} (no matching enabled option for {value})")
+                        continue
+                elif not self._fill_control(locator, value):
+                    report["skipped"].append(f"{field} (could not select {value})")
+                    continue
+                if field == "Repairer licence number":
+                    page.wait_for_timeout(1400)
+                elif field in {"State", "District", "Taluk", "Town / Village", "Street"}:
+                    page.wait_for_timeout(600)
+                report["filled"].append(field)
+            except Exception as exc:
+                report["skipped"].append(f"{field}: {exc}")
+
+        if fields.get("Stamping office/site", "").lower() == "site":
+            dormant = self._field_for(["Dormant / Other", "Dormant / other", "Dormant"])
+            if dormant is None or not dormant.count() or not self._fill_control(dormant, fields.get("Dormant / Other", "Other")):
+                report["skipped"].append("Site Dormant / Other choice")
+            else:
+                report["filled"].append("Site Dormant / Other choice")
+
+        same_details_checked = self._check_same_details()
+        if not same_details_checked:
+            report["skipped"].append("Same Details for Manufacturer / Trader / Establishment (checkbox not found or unchecked)")
         applicant_name = fields.get("Applicant / establishment name", "")
         manufacturer_scope = self._section_locator(r"Manufacturer\s*/\s*Trader\s*/\s*Establishment")
         establishment_controls = [control for control in self._controls_matching(manufacturer_scope, r"establishment\s*name")
@@ -805,10 +847,10 @@ class PortalWorker(threading.Thread):
             try:
                 establishment_controls[0].fill(applicant_name)
                 report["filled"].append("Manufacturer / Trader establishment name")
-            except Exception:
-                report["skipped"].append("Manufacturer / Trader establishment name")
+            except Exception as exc:
+                report["skipped"].append(f"Manufacturer / Trader establishment name: {exc}")
         elif applicant_name:
-            report["skipped"].append("Manufacturer / Trader establishment name")
+            report["skipped"].append("Manufacturer / Trader establishment name (control not found)")
 
         license_establishment = page.locator("#establishmentname")
         used_by = page.locator("#trader-name")
@@ -821,49 +863,47 @@ class PortalWorker(threading.Thread):
                     report["filled"].append("Repaired by / Used by")
                 else:
                     report["skipped"].append("Repaired by / Used by (license establishment name unavailable)")
-            except Exception:
-                report["skipped"].append("Repaired by / Used by")
+            except Exception as exc:
+                report["skipped"].append(f"Repaired by / Used by: {exc}")
 
-        machine_kinds = {
-            "Electronic" if "electronic" in row.get("Instrument description", "").lower()
-            else "Mechanical" if "mechanical" in row.get("Instrument description", "").lower()
-            else "Other"
-            for row in machines if row.get("Instrument description")
-        }
-        new_goods_choice = next(iter(machine_kinds)) if len(machine_kinds) == 1 else "Other"
-        if not self._select_best(page.locator("#newgood"), new_goods_choice):
-            report["skipped"].append("New goods / machine type choice")
-        if new_goods_choice == "Electronic":
-            electronic_max = max((self._capacity_kg(row.get("Maximum capacity", "")) for row in machines if "electronic" in row.get("Instrument description", "").lower()), default=0)
-            capacity_choice = "Above 3 tonnes" if electronic_max > 3000 else "Below 3 tonnes"
-            if not self._select_best(page.locator("#tonnes"), capacity_choice):
-                # The dependent choice may appear only after selecting Electronic.
-                page.wait_for_timeout(500)
-                if not self._select_best(page.locator("#tonnes"), capacity_choice):
-                    report["skipped"].append("Weighing machine capacity range")
-        if not self._select_best(page.locator("#stamping-intend"), "Re-verification"):
-            report["skipped"].append("Stamping purpose: Re-verification")
-        if not self._select_best(page.locator("#applicant-licence-id"), "Repairer"):
-            report["skipped"].append("Applicant licence type: Repairer")
-        if fields.get("Stamping office/site", "").lower() == "site":
-            dormant = self._field_for(["Dormant / Other", "Dormant / other", "Dormant"])
-            if dormant is None or not self._select_best(dormant, fields.get("Dormant / Other", "Other")):
-                report["skipped"].append("Site Dormant / Other choice")
+        critical_fields = (
+            "Applicant / establishment name", "Stamping office/site", "Repairer licence number", "Repairer name",
+            "Previous CV number", "Previous CV date", "State", "District", "Taluk", "Town / Village",
+            "Street", "Door number", "Pincode", "PAN name", "PAN number", "PAN date",
+        )
+        filled_names = set(report["filled"])
+        for field in critical_fields:
+            if fields.get(field) and field not in filled_names:
+                report["required_blank"].append(f"Portal field not filled: {field}")
+        if applicant_name and "Manufacturer / Trader establishment name" not in filled_names:
+            report["required_blank"].append("Portal field not filled: Manufacturer / Trader establishment name")
+        if used_by.count() and "Repaired by / Used by" not in filled_names:
+            report["required_blank"].append("Portal field not filled: Repaired by / Used by")
+        if not same_details_checked:
+            report["required_blank"].append("Portal checkbox not selected: Same Details for Manufacturer / Trader / Establishment")
 
-        # Documents are uploaded on the establishment page before proceeding.
+        # Upload the first-page attachments after the matching fields are ready.
         attachments = [
             ("Upload the purchase Invoice/Previous CV", "#pur-invo-file", payload.get("certificate")),
             ("Upload the Authorisation Letter from the user/owner", "#repairerletter", payload.get("authorization")),
             ("Upload copy of PAN card", "#pancard-file", payload.get("pan_image_data")),
         ]
+        upload_actions = []
         for label, selector, file_path in attachments:
             if not file_path:
                 continue
-            locator = page.locator(selector) if selector else self._file_input_for(label)
             try:
-                if not locator:
-                    report["skipped"].append(f"Upload: {label}")
-                elif isinstance(file_path, dict):
+                locator = page.locator(selector)
+                if not locator.count():
+                    report["skipped"].append(f"Upload: {label} (control not found)")
+                    continue
+                top = locator.first.evaluate("el => el.getBoundingClientRect().top")
+                upload_actions.append((float(top), label, locator.first, file_path))
+            except Exception:
+                report["skipped"].append(f"Upload: {label} (control not found)")
+        for _top, label, locator, file_path in sorted(upload_actions, key=lambda action: action[0]):
+            try:
+                if isinstance(file_path, dict):
                     if len(file_path.get("buffer", b"")) > 1024 * 1024:
                         report["skipped"].append(f"{label} exceeds the portal's 1 MB file limit")
                     else:
@@ -872,8 +912,8 @@ class PortalWorker(threading.Thread):
                     report["skipped"].append(f"{label} exceeds the portal's 1 MB file limit")
                 else:
                     locator.set_input_files(file_path); report["uploaded"].append(label)
-            except Exception:
-                report["skipped"].append(f"Upload: {label}")
+            except Exception as exc:
+                report["skipped"].append(f"Upload: {label}: {exc}")
 
     @staticmethod
     def _capacity_kg(value: str) -> float:
@@ -891,8 +931,10 @@ class PortalWorker(threading.Thread):
     def _check_same_details(self):
         try:
             checkbox = self.page.get_by_label(re.compile(r"Same Details for Manufacturer\s*/\s*Trader\s*/\s*Establishment", re.I)).first
-            if checkbox.count() and not checkbox.is_checked():
-                checkbox.check()
+            if checkbox.count():
+                if not checkbox.is_checked():
+                    checkbox.check()
+                return checkbox.is_checked()
         except Exception:
             # Fall back to checkbox labels whose text includes the requested phrase.
             for label in self.page.locator("label").all():
@@ -900,25 +942,35 @@ class PortalWorker(threading.Thread):
                     if re.search(r"Same Details for Manufacturer\s*/\s*Trader\s*/\s*Establishment", label.inner_text(), re.I):
                         control = label.locator("input[type=checkbox]").first
                         if control.count() and not control.is_checked(): control.check()
-                        return
+                        return control.count() and control.is_checked()
                 except Exception:
                     continue
+        return False
 
     def _click_next(self, expected_page):
         page = self.page
-        next_button = page.get_by_role("button", name=re.compile(r"\bnext\b", re.I)).last
-        if not next_button.count():
-            next_button = page.get_by_role("link", name=re.compile(r"\bnext\b", re.I)).last
-        if not next_button.count():
-            next_button = page.locator('input[type="button"][value*="Next" i],input[type="submit"][value*="Next" i]').last
-        if not next_button.count() or not next_button.is_visible():
+        next_button = None
+        visible_labels = []
+        for candidate in page.locator("button:visible,input[type='button']:visible,input[type='submit']:visible,[role='button']:visible,a:visible").all():
+            try:
+                label = " ".join(filter(None, [candidate.inner_text(timeout=500), candidate.get_attribute("value"), candidate.get_attribute("aria-label")])).strip()
+                if label:
+                    visible_labels.append(label)
+                if re.search(r"\bnext\b", label, re.I) and candidate.is_enabled():
+                    next_button = candidate
+            except Exception:
+                continue
+        if next_button is None:
             raise RuntimeError(f"Could not find the Next control for the {expected_page}. Review the current portal page.")
-        next_button.click()
+        previous_url = page.url
+        next_button.click(timeout=10000)
         try:
-            page.wait_for_load_state("domcontentloaded", timeout=10000)
+            page.wait_for_load_state("domcontentloaded", timeout=12000)
         except Exception:
             pass
-        page.wait_for_timeout(700)
+        page.wait_for_timeout(1000)
+        if page.url == previous_url and not re.search(r"submit|review|application", " ".join(visible_labels), re.I):
+            page.wait_for_timeout(900)
 
     def _collect_visible_required(self, report):
         try:
@@ -988,8 +1040,24 @@ class PortalWorker(threading.Thread):
         return matches
 
     def _fill_control(self, control, value):
-        if control.evaluate("el => el.tagName.toLowerCase()") == "select":
+        tag, kind = control.evaluate("el => [el.tagName.toLowerCase(), (el.getAttribute('type') || '').toLowerCase()]")
+        if tag == "select":
             return self._select_best(control, value)
+        if kind in {"radio", "checkbox"}:
+            name = control.get_attribute("name")
+            candidates = self.page.locator(f"input[name='{name}']") if name else control.locator("xpath=..").locator("input[type=radio],input[type=checkbox]")
+            target = self._norm(value)
+            for candidate in candidates.all():
+                label_text = ""
+                try:
+                    label_text = candidate.evaluate("el => [...(el.labels || [])].map(x => x.innerText).join(' ')")
+                    option = " ".join(filter(None, [label_text, candidate.get_attribute("value"), candidate.get_attribute("aria-label")]))
+                    if target in self._norm(option) or self._norm(option) in target:
+                        candidate.check()
+                        return True
+                except Exception:
+                    continue
+            return False
         control.fill(value)
         return True
 
@@ -1338,6 +1406,17 @@ class PortalWorker(threading.Thread):
                 pass
         return None
 
+    def _find_visible_submit(self):
+        page = self.page
+        for candidate in page.locator("button:visible,input[type='submit']:visible,input[type='button']:visible,[role='button']:visible,a:visible").all():
+            try:
+                label = " ".join(filter(None, [candidate.inner_text(timeout=500), candidate.get_attribute("value"), candidate.get_attribute("aria-label"), candidate.get_attribute("title")])).strip()
+                if re.search(r"\bsubmit\b", label, re.I) and candidate.is_enabled():
+                    return candidate
+            except Exception:
+                continue
+        return None
+
     def _submit(self):
         page = self.page
         payment_text = re.compile(r"make payment|proceed to payment|pay now|payment gateway|payment successful", re.I)
@@ -1345,11 +1424,11 @@ class PortalWorker(threading.Thread):
             self.messages.put(("payment", "The portal is already at a payment step. The assistant will not interact with payment."))
             return
         if not self.ready_for_submit:
-            self._navigate_to_stamping_form()
-        submit = page.get_by_role("button", name=re.compile(r"submit", re.I)).last
-        if not submit.count():
-            submit = page.locator('input[type="submit"]').last
-        submit.click()
+            raise RuntimeError("The application has not reached a verified final review page. Use Fill now / retry to complete the visible page first.")
+        submit = self._find_visible_submit()
+        if submit is None:
+            raise RuntimeError("No visible Submit control is present on the current portal page. The application was not submitted; continue filling the current page.")
+        submit.click(timeout=10000)
         try:
             page.wait_for_load_state("domcontentloaded", timeout=15000)
         except Exception:
