@@ -22,7 +22,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\build.ps1
 ```
 
-The executable will be created at `dist\TN_Stamping_Assistant_v9.exe`. The build script downloads Python packages into `.build-deps`, downloads Chromium into `.pw-browsers`, and bundles both with PyInstaller. The app opens its own Chromium window and does not use installed Chrome. CAPTCHA completion is the only login step requiring your input.
+The executable will be created at `dist\TN_Stamping_Assistant_v10.exe`. The build script downloads Python packages into `.build-deps`, downloads Chromium into `.pw-browsers`, and bundles both with PyInstaller. The app opens its own Chromium window and does not use installed Chrome. CAPTCHA completion is the only login step requiring your input.
 
 To run from source instead:
 
@@ -33,12 +33,14 @@ python stamping_assistant.py
 
 ## Use
 
-1. Choose an email from the sign-in dropdown or click **Add account** to save the email, password, PAN details and image, and License Number together. Each account uses its own PAN profile.
+1. Choose an email from the sign-in dropdown. Use **Add account** to save a new email/password with its PAN details and image and License Number, or **Edit credentials** to update the selected account. If you edit credentials while the portal is waiting for login, the open login form is updated too.
 2. Choose the Previous CV/purchase invoice PDF and the owner authorisation letter. The selected account's PAN image is uploaded automatically.
 3. Choose **Read PDF and fill draft**. Review and correct every value in the editable fields. Only values found in the PDF are suggested.
 4. Choose **Start application**. The selected saved email and password are filled automatically. Complete the CAPTCHA in the bundled Chromium window; the app clicks Login and proceeds automatically.
 5. Review applicant/address/PAN fields in **Application review — applicant and first page**, then review weight/type, make, max, min, e/d, model, machine number, class, and quantity in the machine details row. Use **Fill now / retry** if needed. Fields missing from the certificate need your entry.
 6. When the required portal fields are complete, the app submits the application and stops at the payment page. Review the submitted details and complete payment yourself. Use **Submit to payment page (retry)** only if the automatic submit needs another attempt.
+
+Use the mouse wheel or the vertical scrollbar to move through the application window.
 
 ## Limits
 

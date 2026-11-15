@@ -287,6 +287,12 @@ class PortalWorker(threading.Thread):
                             self._submit()
                     elif cmd == "submit":
                         self._submit()
+                    elif cmd == "credentials":
+                        if not self._logged_in():
+                            if self.pending_application is None:
+                                self.pending_application = payload.get("application")
+                            self._fill_login(payload["credentials"])
+                            self.messages.put(("status", "Updated the login form with the edited saved credentials. Complete the CAPTCHA again to retry."))
                 except Exception as e:
                     self.messages.put(("error", f"Portal action stopped safely: {e}"))
             try:
@@ -717,6 +723,24 @@ class App(tk.Tk):
         style.configure("Primary.TButton", background="#1261a0", foreground="white")
         style.map("Primary.TButton", background=[("active", "#0c4b7d")])
 
+    def _mousewheel(self, event):
+        widget = self.winfo_containing(event.x_root, event.y_root)
+        while widget is not None:
+            if widget is self.scroll_canvas:
+                if getattr(event, "num", None) == 4:
+                    units = -1
+                elif getattr(event, "num", None) == 5:
+                    units = 1
+                else:
+                    delta = getattr(event, "delta", 0)
+                    units = -int(delta / 120) if delta else 0
+                    if delta and units == 0:
+                        units = -1 if delta > 0 else 1
+                if units:
+                    self.scroll_canvas.yview_scroll(units, "units")
+                return "break"
+            widget = getattr(widget, "master", None)
+
     def _build(self):
         outer = ttk.Frame(self, padding=22)
         outer.pack(fill="both", expand=True)
@@ -728,6 +752,10 @@ class App(tk.Tk):
         body.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.create_window((0, 0), window=body, anchor="nw", width=960)
         canvas.configure(yscrollcommand=scrollbar.set)
+        self.scroll_canvas = canvas
+        self.bind_all("<MouseWheel>", self._mousewheel)
+        self.bind_all("<Button-4>", self._mousewheel)
+        self.bind_all("<Button-5>", self._mousewheel)
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
@@ -740,6 +768,7 @@ class App(tk.Tk):
         self.account_combo.pack(side="left", fill="x", expand=True)
         self.account_combo.bind("<<ComboboxSelected>>", self._on_account_selected)
         ttk.Button(row, text="Add account", command=self.add_account, style="Primary.TButton").pack(side="left", padx=(10, 0))
+        ttk.Button(row, text="Edit credentials", command=self.edit_account).pack(side="left", padx=(8, 0))
 
         first_page = self._card(body, "Application review — applicant and first page")
         ttk.Button(first_page, text="Read PDF and fill draft", command=self.read_pdf, style="Primary.TButton").pack(anchor="w", pady=(8, 6))
@@ -905,9 +934,16 @@ class App(tk.Tk):
                 self.vars["PAN date"].set(self.pan_date.get())
                 self.vars["Repairer licence number"].set(self.license_number.get())
 
-    def add_account(self):
+    def edit_account(self):
+        index = self.account_combo.current()
+        if index < 0 or index >= len(self.accounts):
+            messagebox.showinfo("Choose an account", "Select an email from the dropdown before editing its credentials.")
+            return
+        self.add_account(edit_index=index)
+
+    def add_account(self, edit_index=None):
         window = tk.Toplevel(self)
-        window.title("Add portal account")
+        window.title("Edit portal account" if edit_index is not None else "Add portal account")
         window.transient(self)
         window.grab_set()
         window.geometry("540x690")
@@ -959,7 +995,7 @@ class App(tk.Tk):
             email = email_var.get().strip().casefold()
             existing = next((item for item in self.accounts if item.get("username", "").casefold() == email), None)
             if not existing:
-                if loaded_email["value"] and loaded_email["value"] != email:
+                if edit_index is None and loaded_email["value"] and loaded_email["value"] != email:
                     password_var.set(""); pan_name_var.set(""); pan_number_var.set("")
                     pan_date_var.set(""); license_var.set("")
                     image_data["b64"] = ""; image_data["name"] = ""
@@ -978,6 +1014,19 @@ class App(tk.Tk):
 
         email_entry.bind("<FocusOut>", load_existing)
 
+        if edit_index is not None and 0 <= edit_index < len(self.accounts):
+            current = self.accounts[edit_index]
+            email_var.set(current.get("username", ""))
+            password_var.set(current.get("password", ""))
+            pan_name_var.set(current.get("pan_name", ""))
+            pan_number_var.set(current.get("pan_number", ""))
+            pan_date_var.set(current.get("pan_date", ""))
+            license_var.set(current.get("license_number", ""))
+            image_data["b64"] = current.get("pan_image_b64", "")
+            image_data["name"] = current.get("pan_image_name", "")
+            image_label.set(image_data["name"] or "No PAN image selected")
+            loaded_email["value"] = current.get("username", "").casefold()
+
         def save_account():
             email, password = email_var.get().strip(), password_var.get()
             if not email or not password:
@@ -988,6 +1037,12 @@ class App(tk.Tk):
                 return
             old_accounts = self.accounts
             match_index = next((i for i, item in enumerate(self.accounts) if item.get("username", "").casefold() == email.casefold()), None)
+            if edit_index is not None:
+                duplicate = match_index is not None and match_index != edit_index
+                if duplicate:
+                    messagebox.showwarning("Email already saved", "That email belongs to another saved account. Use a unique email address.", parent=window)
+                    return
+                match_index = edit_index
             record = dict(self.accounts[match_index]) if match_index is not None else {}
             record.update({
                 "username": email, "password": password,
@@ -1010,10 +1065,15 @@ class App(tk.Tk):
                 return
             self._refresh_accounts(match_index)
             self.status.set(f"Saved encrypted account for {email}.")
+            if self.worker and self.worker.is_alive() and self.account_combo.current() == match_index:
+                self.worker.send("credentials", {
+                    "credentials": {"username": email, "password": password},
+                    "application": self._application_payload(),
+                })
             window.destroy()
 
         buttons = ttk.Frame(pad); buttons.pack(fill="x", pady=(16, 0))
-        ttk.Button(buttons, text="Save account", command=save_account, style="Primary.TButton").pack(side="left")
+        ttk.Button(buttons, text="Save changes" if edit_index is not None else "Save account", command=save_account, style="Primary.TButton").pack(side="left")
         ttk.Button(buttons, text="Cancel", command=window.destroy).pack(side="right")
 
     def open_portal(self):
