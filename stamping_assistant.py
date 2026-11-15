@@ -750,8 +750,7 @@ class PortalWorker(threading.Thread):
 
     def _fill_establishment_page(self, fields, machines, payload, report):
         page = self.page
-        # Make the dependent machine type visible first, then order every visible
-        # first-page field by its actual top-to-bottom position in the portal DOM.
+        # Order first-page inputs, choices, and uploads by visible position.
         machine_kinds = {
             "Electronic" if "electronic" in row.get("Instrument description", "").lower()
             else "Mechanical" if "mechanical" in row.get("Instrument description", "").lower()
@@ -760,18 +759,6 @@ class PortalWorker(threading.Thread):
         }
         new_goods_choice = next(iter(machine_kinds)) if len(machine_kinds) == 1 else "Other"
         new_goods = page.locator("#newgood")
-        if new_goods.count():
-            try:
-                if not self._select_best(new_goods, new_goods_choice):
-                    report["skipped"].append("New goods / machine type choice")
-                else:
-                    report["filled"].append("New goods / machine type choice")
-                    page.wait_for_timeout(350)
-            except Exception as exc:
-                report["skipped"].append(f"New goods / machine type choice: {exc}")
-        else:
-            report["skipped"].append("New goods / machine type choice (control not found)")
-
         electronic_max = max((self._capacity_kg(row.get("Maximum capacity", "")) for row in machines if "electronic" in row.get("Instrument description", "").lower()), default=0)
         capacity_choice = "Above 3 tonnes" if electronic_max > 3000 else "Below 3 tonnes"
         actions = []
@@ -788,6 +775,14 @@ class PortalWorker(threading.Thread):
                 actions.append((float(top), field, locator.first, value, "field"))
             except Exception as exc:
                 report["skipped"].append(f"{field} (could not locate control: {exc})")
+
+        if new_goods.count():
+            try:
+                actions.append((float(new_goods.first.evaluate("el => el.getBoundingClientRect().top")), "New goods / machine type choice", new_goods.first, new_goods_choice, "field"))
+            except Exception as exc:
+                report["skipped"].append(f"New goods / machine type choice: {exc}")
+        else:
+            report["skipped"].append("New goods / machine type choice (control not found)")
 
         checkbox = self._same_details_checkbox()
         if checkbox is not None:
@@ -825,8 +820,6 @@ class PortalWorker(threading.Thread):
             ("Stamping purpose: Re-verification", "#stamping-intend", "Re-verification"),
             ("Applicant licence type: Repairer", "#applicant-licence-id", "Repairer"),
         ]
-        if new_goods_choice == "Electronic":
-            special_choices.append(("Weighing machine capacity range", "#tonnes", capacity_choice))
         for label, selector, value in special_choices:
             locator = page.locator(selector)
             try:
@@ -837,6 +830,16 @@ class PortalWorker(threading.Thread):
                     report["skipped"].append(f"{label} (control not found or not visible)")
             except Exception as exc:
                 report["skipped"].append(f"{label} (could not locate control: {exc})")
+
+        if fields.get("Stamping office/site", "").lower() == "site":
+            dormant = self._field_for(["Dormant / Other", "Dormant / other", "Dormant"])
+            if dormant is not None and dormant.count():
+                try:
+                    actions.append((float(dormant.first.evaluate("el => el.getBoundingClientRect().top")), "Site Dormant / Other choice", dormant.first, fields.get("Dormant / Other", "Other"), "field"))
+                except Exception as exc:
+                    report["skipped"].append(f"Site Dormant / Other choice: {exc}")
+            else:
+                report["skipped"].append("Site Dormant / Other choice (control not found)")
 
         attachments = [
             ("Upload the purchase Invoice/Previous CV", "#pur-invo-file", payload.get("certificate")),
@@ -861,8 +864,24 @@ class PortalWorker(threading.Thread):
                 report["skipped"].append(f"Upload: {label}: {exc}")
 
         same_details_checked = False
-        for _top, field, locator, value, action_type in sorted(actions, key=lambda action: action[0]):
+        pending_actions = sorted(actions, key=lambda action: action[0])
+        while pending_actions:
+            _top, field, locator, value, action_type = pending_actions.pop(0)
             try:
+                # Form entry uses fill/select/check APIs; Enter is never sent to the portal.
+                if field == "New goods / machine type choice":
+                    if self._select_best(locator, value):
+                        page.wait_for_timeout(350)
+                        report["filled"].append(field)
+                        if new_goods_choice == "Electronic":
+                            capacity = page.locator("#tonnes")
+                            if capacity.count() and capacity.first.is_visible():
+                                top = float(capacity.first.evaluate("el => el.getBoundingClientRect().top"))
+                                pending_actions.append((top, "Weighing machine capacity range", capacity.first, capacity_choice, "field"))
+                                pending_actions.sort(key=lambda action: action[0])
+                    else:
+                        report["skipped"].append(field)
+                    continue
                 if action_type == "checkbox":
                     if not locator.is_checked():
                         locator.check()
@@ -912,12 +931,10 @@ class PortalWorker(threading.Thread):
             except Exception as exc:
                 report["skipped"].append(f"{field}: {exc}")
 
-        if fields.get("Stamping office/site", "").lower() == "site":
-            dormant = self._field_for(["Dormant / Other", "Dormant / other", "Dormant"])
-            if dormant is None or not dormant.count() or not self._fill_control(dormant, fields.get("Dormant / Other", "Other")):
-                report["skipped"].append("Site Dormant / Other choice")
-            else:
-                report["filled"].append("Site Dormant / Other choice")
+        if "Site Dormant / Other choice (control not found)" in report["skipped"]:
+            pass
+        elif fields.get("Stamping office/site", "").lower() == "site" and "Site Dormant / Other choice" not in report["filled"]:
+            report["skipped"].append("Site Dormant / Other choice")
 
         critical_fields = (
             "Applicant / establishment name", "Stamping office/site", "Repairer licence number", "Repairer name",
@@ -1982,12 +1999,17 @@ class App(tk.Tk):
 
     def _application_payload(self):
         fields = {k: v.get().strip() for k, v in self.vars.items()}
+        # The portal's establishment name is the company name parsed/reviewed
+        # from the certificate. PAN identity and repairer identity are separate.
+        company_name = fields.get("Applicant business name", "").strip() or fields.get("Applicant / establishment name", "").strip()
+        if company_name:
+            fields["Applicant business name"] = company_name
+            fields["Applicant / establishment name"] = company_name
         fields["PAN name"] = fields.get("PAN name", "") or self.pan_name.get().strip()
         fields["PAN number"] = fields.get("PAN number", "") or self.pan_number.get().strip()
         fields["PAN date"] = fields.get("PAN date", "") or self.pan_date.get().strip()
         fields["Repairer licence number"] = self.license_number.get().strip() or fields.get("Repairer licence number", "")
         fields["Repairer name"] = self.pan_name.get().strip() or fields.get("Repairer name", "")
-        fields["Applicant business name"] = fields.get("Applicant business name", "") or fields.get("Applicant / establishment name", "")
         fields["Applicant contact name"] = fields.get("Applicant contact name", "") or self.contact_var.get().strip()
         fields["Registered name"] = fields.get("Registered name", "") or self.contact_var.get().strip()
         fields["Registered email"] = self.user_var.get().strip() or fields.get("Registered email", "")
@@ -2061,3 +2083,4 @@ class App(tk.Tk):
 
 if __name__ == "__main__":
     App().mainloop()
+
