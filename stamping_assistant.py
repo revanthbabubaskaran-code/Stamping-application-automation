@@ -724,6 +724,27 @@ class PortalWorker(threading.Thread):
                 pass
         return self._field_for(FIELD_LABELS.get(field, [field]))
 
+    def _field_in_section(self, heading_pattern, label_pattern):
+        scope = self._section_locator(heading_pattern)
+        try:
+            for label in scope.locator("label").all():
+                if not label.is_visible():
+                    continue
+                label_text = self._norm(label.inner_text())
+                if not re.fullmatch(label_pattern, label_text, re.I):
+                    continue
+                target_id = label.get_attribute("for")
+                if target_id:
+                    control = self.page.locator(f"#{target_id}")
+                    if control.count() and control.first.is_visible():
+                        return control.first
+                nested = label.locator("input,select,textarea").first
+                if nested.count() and nested.is_visible():
+                    return nested
+        except Exception:
+            pass
+        return None
+
     @staticmethod
     def _field_value_matches(locator, expected):
         try:
@@ -805,11 +826,22 @@ class PortalWorker(threading.Thread):
         electronic_max = max((self._capacity_kg(row.get("Maximum capacity", "")) for row in machines if "electronic" in row.get("Instrument description", "").lower()), default=0)
         capacity_choice = "Above 3 tonnes" if electronic_max > 3000 else "Below 3 tonnes"
         actions = []
+        establishment_labels = {
+            "Applicant / establishment name": r"name",
+            "State": r"state",
+            "District": r"district",
+            "Taluk": r"taluk",
+            "Town / Village": r"town\s+village",
+            "Street": r"street",
+            "Door number": r"door\s+number",
+            "Pincode": r"pincode|pin\s+code",
+        }
         excluded = set(LOCAL_ONLY_FIELDS) | {"Applicant business name", "Used by / trader contact"}
         for field, value in fields.items():
             if not value or field in excluded:
                 continue
-            locator = self._portal_field(field)
+            locator = (self._field_in_section(r"Establishment\s+Details", establishment_labels[field])
+                       if field in establishment_labels else self._portal_field(field))
             try:
                 if locator is None or not locator.count() or not locator.first.is_visible():
                     report["skipped"].append(f"{field} (control not found or not visible)")
