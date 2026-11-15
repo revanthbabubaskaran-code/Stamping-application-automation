@@ -5,10 +5,10 @@ A local Windows desktop helper for preparing the Tamil Nadu Labour Department we
 ## What it does
 
 - Reads text from a selectable-text PDF and prepares an editable application draft.
-- Saves the portal email/password and PAN details plus the selected PAN image in a Windows DPAPI encrypted profile for the current Windows account.
+- Saves each portal email/password with that account's PAN name, number, date, license number, and PAN image in the Windows DPAPI encrypted profile for the current Windows account.
 - Opens a dedicated Chromium browser bundled with the app, waits for the portal login form, and fills the selected saved email and password. You enter/solve the CAPTCHA; the app detects completion, clicks Login, opens Legal Metrology → Verification and Stamping → Stamping → + New Stamping, fills the draft and uploads, then submits to the payment page when all browser-required fields are complete.
 - Fills visible portal fields using the labels and field IDs on the current stamping form.
-- Uploads the selected Previous CV/purchase invoice, repairer licence copy (if the upload control is available), owner authorisation letter, and PAN card image.
+- Uploads the selected Previous CV/purchase invoice and owner authorisation letter, plus the PAN image belonging to the selected account.
 - Stops for any remaining required fields that could not be filled from your saved details or source PDF. It does not solve CAPTCHA, make legal declarations, or click anything on the payment page.
 
 ## Build the EXE
@@ -22,7 +22,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\build.ps1
 ```
 
-The executable will be created at `dist\TN_Stamping_Assistant_v6.exe`. The build script downloads Python packages into `.build-deps`, downloads Chromium into `.pw-browsers`, and bundles both with PyInstaller. The app opens its own Chromium window and does not use installed Chrome. CAPTCHA completion is the only login step requiring your input.
+The executable will be created at `dist\TN_Stamping_Assistant_v8.exe`. The build script downloads Python packages into `.build-deps`, downloads Chromium into `.pw-browsers`, and bundles both with PyInstaller. The app opens its own Chromium window and does not use installed Chrome. CAPTCHA completion is the only login step requiring your input.
 
 To run from source instead:
 
@@ -33,11 +33,11 @@ python stamping_assistant.py
 
 ## Use
 
-1. Use **Manage saved sign-ins** to add a named portal account; select it from the sign-in dropdown. Add applicant business/contact and PAN details. Choose the PAN image if you want it saved for reuse, then choose **Save encrypted profile**.
-2. Choose the Previous CV/purchase invoice PDF, the owner authorisation letter, and the PAN card image. Add the repairer licence copy if the form requests it.
+1. Choose an email from the sign-in dropdown or click **Add account** to save the email, password, PAN details and image, and License Number together. Each account uses its own PAN profile.
+2. Choose the Previous CV/purchase invoice PDF and the owner authorisation letter. The selected account's PAN image is uploaded automatically.
 3. Choose **Read PDF and fill draft**. Review and correct every value in the editable fields. Only values found in the PDF are suggested.
 4. Choose **Start application**. The selected saved email and password are filled automatically. Complete the CAPTCHA in the bundled Chromium window; the app clicks Login and proceeds automatically.
-5. Check the field and upload report in the app. Inspect the entire form in the bundled Chromium window. Use **Fill now / retry** if needed. The old certificate can fill the instrument user's establishment address; the applicant/licence holder address and any required fields not present in the certificate need your entry.
+5. Review applicant/address/PAN fields in **Application review — applicant and first page**, then review weight/type, make, max, min, e/d, model, machine number, class, and quantity in the machine details row. Use **Fill now / retry** if needed. Fields missing from the certificate need your entry.
 6. When the required portal fields are complete, the app submits the application and stops at the payment page. Review the submitted details and complete payment yourself. Use **Submit to payment page (retry)** only if the automatic submit needs another attempt.
 
 ## Limits

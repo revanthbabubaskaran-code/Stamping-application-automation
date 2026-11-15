@@ -56,6 +56,7 @@ FIELD_LABELS = {
     "Quantity": ["quantity", "number of instruments", "no. of instruments"],
     "Repairer name": ["repairer name", "repaired by", "repairer"],
     "Repairer licence number": ["repairer licence number", "repairer license number", "licence number", "license number"],
+    "PAN name": ["pan name", "name on pan", "pan card name"],
     "PAN number": ["pan number", "pan card number"],
     "PAN date": ["date in pan card", "pan date"],
     "Applicant business name": ["establishment name"],
@@ -100,6 +101,11 @@ PORTAL_IDS = {
 LOCAL_ONLY_FIELDS = {
     "Business address", "Instrument make", "Instrument model", "Machine number",
     "Maximum capacity", "Minimum capacity", "Verification interval (e/d)", "Class",
+}
+
+MACHINE_REVIEW_FIELDS = {
+    "Instrument description", "Instrument make", "Instrument model", "Machine number",
+    "Maximum capacity", "Minimum capacity", "Verification interval (e/d)", "Class", "Quantity",
 }
 
 
@@ -539,7 +545,6 @@ class PortalWorker(threading.Thread):
 
         attachments = [
             ("Upload the purchase Invoice/Previous CV", "#pur-invo-file", payload.get("certificate")),
-            ("Upload Repairer License", None, payload.get("repairer_license")),
             ("Upload the Authorisation Letter from the user/owner", "#repairerletter", payload.get("authorization")),
             ("Upload copy of PAN card", "#pancard-file", payload.get("pan_image_data")),
         ]
@@ -673,7 +678,7 @@ class App(tk.Tk):
             self.profile = load_vault()
         except Exception as e:
             messagebox.showerror("Profile could not be opened", f"Encrypted profile could not be read. It may belong to another Windows user.\n\n{e}")
-        self.files = {"certificate": "", "repairer_license": "", "authorization": "", "pan_image": ""}
+        self.files = {"certificate": "", "authorization": ""}
         self.vars = {}
         self._styles()
         self._build()
@@ -712,35 +717,27 @@ class App(tk.Tk):
         self.user_var = tk.StringVar(); self.pass_var = tk.StringVar()
         self.account_var = tk.StringVar()
         self.business_var = tk.StringVar(); self.contact_var = tk.StringVar(); self.mobile_var = tk.StringVar(); self.trader_contact_var = tk.StringVar()
-        ttk.Label(row, text="Saved sign-in", background="white").pack(side="left", padx=(0, 10))
         self.account_combo = ttk.Combobox(row, textvariable=self.account_var, state="readonly", width=48)
         self.account_combo.pack(side="left", fill="x", expand=True)
         self.account_combo.bind("<<ComboboxSelected>>", self._on_account_selected)
-        ttk.Button(row, text="Manage saved sign-ins", command=self.manage_credentials).pack(side="left", padx=(10, 0))
-        contacts = ttk.Frame(login, style="Card.TFrame"); contacts.pack(fill="x", pady=(0, 8))
-        for col, (label, var, width) in enumerate((("Applicant business name", self.business_var, 24), ("Authorised contact name", self.contact_var, 24), ("Applicant mobile", self.mobile_var, 16), ("Trader / user contact", self.trader_contact_var, 22))):
-            ttk.Label(contacts, text=label, background="white").grid(row=0, column=col, sticky="w", padx=(0, 12))
-            ttk.Entry(contacts, textvariable=var, width=width).grid(row=1, column=col, sticky="ew", padx=(0, 12))
-            contacts.columnconfigure(col, weight=1)
-        ttk.Button(login, text="Save applicant and PAN details", command=self.save_profile).pack(anchor="e")
-        ttk.Label(login, text="Saved sign-ins and PAN data are encrypted for this Windows account. Complete CAPTCHA in the app browser.", background="white", foreground="#6c7b8d").pack(anchor="w", pady=(6, 0))
+        ttk.Button(row, text="Add account", command=self.add_account, style="Primary.TButton").pack(side="left", padx=(10, 0))
 
-        docs = self._card(body, "Documents and PAN profile")
-        self._file_row(docs, "Previous CV / purchase invoice (PDF)", "certificate", ("PDF files", "*.pdf"))
-        self._file_row(docs, "Repairer licence copy (if requested by portal)", "repairer_license", ("PDF or image", "*.pdf *.jpg *.jpeg *.png *.bmp"))
-        self._file_row(docs, "Owner authorization letter (PDF or image)", "authorization", ("PDF or image", "*.pdf *.jpg *.jpeg *.png"))
-        self._file_row(docs, "PAN card image (JPG or PNG)", "pan_image", ("Image files", "*.jpg *.jpeg *.png"))
-        pan = ttk.Frame(docs, style="Card.TFrame"); pan.pack(fill="x", pady=(12, 4))
-        self.pan_name = tk.StringVar(); self.pan_number = tk.StringVar(); self.pan_date = tk.StringVar()
-        for col, (label, var, width) in enumerate((("PAN name", self.pan_name, 30), ("PAN number", self.pan_number, 20), ("Date on PAN", self.pan_date, 18))):
-            ttk.Label(pan, text=label, background="white").grid(row=0, column=col, sticky="w", padx=(0, 12))
-            ttk.Entry(pan, textvariable=var, width=width).grid(row=1, column=col, sticky="ew", padx=(0, 12))
-            pan.columnconfigure(col, weight=1)
-        ttk.Label(docs, text="PAN number, name, date, and selected image are kept in the encrypted profile for reuse. Portal uploads must be under 1 MB.", background="white", foreground="#6c7b8d").pack(anchor="w", pady=(5, 0))
+        first_page = self._card(body, "Application review — applicant and first page")
+        ttk.Button(first_page, text="Read PDF and fill draft", command=self.read_pdf, style="Primary.TButton").pack(anchor="w", pady=(8, 6))
+        self.first_page_field_frame = ttk.Frame(first_page, style="Card.TFrame")
+        self.first_page_field_frame.pack(fill="x")
 
-        draft = self._card(body, "Application details to review")
-        ttk.Button(draft, text="Read PDF and fill draft", command=self.read_pdf, style="Primary.TButton").pack(anchor="w", pady=(8, 6))
-        self.field_frame = ttk.Frame(draft, style="Card.TFrame"); self.field_frame.pack(fill="x")
+        docs = ttk.Frame(first_page, style="Card.TFrame"); docs.pack(fill="x", pady=(14, 0))
+        ttk.Label(docs, text="Documents for the first page", style="Section.TLabel").pack(anchor="w", pady=(0, 6))
+        self._file_row(docs, "Purchase invoice / Previous CV (PDF)", "certificate", ("PDF files", "*.pdf"))
+        self._file_row(docs, "Authorisation letter from user / owner", "authorization", ("PDF or image", "*.pdf *.jpg *.jpeg *.png"))
+
+        machine = self._card(body, "Machine details — certificate table")
+        ttk.Label(machine, text="Review or correct the machine row read from the certificate table.", background="white", foreground="#62738a").pack(anchor="w", pady=(4, 8))
+        self.machine_field_frame = ttk.Frame(machine, style="Card.TFrame")
+        self.machine_field_frame.pack(fill="x")
+        self.pan_name = tk.StringVar(); self.pan_number = tk.StringVar(); self.pan_date = tk.StringVar(); self.license_number = tk.StringVar()
+        ttk.Label(first_page, text="PAN card image is uploaded from the selected account. Portal file uploads must be under 1 MB.", background="white", foreground="#6c7b8d").pack(anchor="w", pady=(8, 0))
         self._set_fields({})
 
         action = ttk.Frame(body, style="Card.TFrame", padding=14); action.pack(fill="x", pady=(12, 5))
@@ -765,31 +762,47 @@ class App(tk.Tk):
         ttk.Button(frame, text="Choose file", command=lambda: self.choose_file(key, file_filter)).pack(side="right")
 
     def choose_file(self, key, file_filter):
-        if key == "certificate":
-            path = filedialog.askopenfilename(filetypes=[file_filter, ("All files", "*.*")])
-        elif key == "authorization":
-            path = filedialog.askopenfilename(filetypes=[file_filter, ("All files", "*.*")])
-        else:
-            path = filedialog.askopenfilename(filetypes=[file_filter, ("All files", "*.*")])
+        path = filedialog.askopenfilename(filetypes=[file_filter, ("All files", "*.*")])
         if path:
             self.files[key] = path
             self.files[key + "_display"].set(Path(path).name)
-            if key == "pan_image":
-                try:
-                    self.profile["pan_image_b64"] = base64.b64encode(Path(path).read_bytes()).decode("ascii")
-                    self.profile["pan_image_name"] = Path(path).name
-                except OSError as e: messagebox.showerror("Could not read PAN image", str(e))
 
     def _set_fields(self, values):
-        for widget in self.field_frame.winfo_children(): widget.destroy()
+        for frame in (self.first_page_field_frame, self.machine_field_frame):
+            for widget in frame.winfo_children(): widget.destroy()
         self.vars.clear()
-        for idx, name in enumerate(FIELD_LABELS):
-            ttk.Label(self.field_frame, text=name, background="white").grid(row=idx, column=0, sticky="w", pady=3, padx=(0, 10))
+        first_idx = 0
+        machine_keys = [
+            "Instrument description", "Instrument make", "Maximum capacity", "Minimum capacity",
+            "Verification interval (e/d)", "Instrument model", "Machine number", "Class", "Quantity",
+        ]
+        machine_headers = {
+            "Instrument description": "Weight / type", "Instrument make": "Make",
+            "Maximum capacity": "Max", "Minimum capacity": "Min",
+            "Verification interval (e/d)": "e/d", "Instrument model": "Model",
+            "Machine number": "Machine number", "Class": "Class", "Quantity": "Qty",
+        }
+        for col, name in enumerate(machine_keys):
+            ttk.Label(self.machine_field_frame, text=machine_headers.get(name, name), background="white", wraplength=105, anchor="center").grid(row=0, column=col, sticky="nsew", padx=2, pady=(0, 4))
             var = tk.StringVar(value=values.get(name, ""))
             self.vars[name] = var
-            ttk.Entry(self.field_frame, textvariable=var, width=75).grid(row=idx, column=1, sticky="ew", pady=3)
-        self.field_frame.columnconfigure(1, weight=1)
+            ttk.Entry(self.machine_field_frame, textvariable=var, width=13).grid(row=1, column=col, sticky="ew", padx=2, pady=2)
+            self.machine_field_frame.columnconfigure(col, weight=1, uniform="machine")
+        for name in FIELD_LABELS:
+            if name in MACHINE_REVIEW_FIELDS:
+                continue
+            frame = self.first_page_field_frame
+            idx = first_idx
+            var = tk.StringVar(value=values.get(name, ""))
+            self.vars[name] = var
+            ttk.Label(frame, text=name, background="white").grid(row=idx, column=0, sticky="w", pady=3, padx=(0, 10))
+            ttk.Entry(frame, textvariable=var, width=75).grid(row=idx, column=1, sticky="ew", pady=3)
+            first_idx += 1
+        self.first_page_field_frame.columnconfigure(1, weight=1)
+        if self.pan_name.get(): self.vars["PAN name"].set(self.pan_name.get())
         if self.pan_number.get(): self.vars["PAN number"].set(self.pan_number.get())
+        if self.pan_date.get(): self.vars["PAN date"].set(self.pan_date.get())
+        if self.license_number.get(): self.vars["Repairer licence number"].set(self.license_number.get())
 
     def read_pdf(self):
         path = self.files.get("certificate")
@@ -802,7 +815,7 @@ class App(tk.Tk):
                 messagebox.showwarning("No selectable text found", "This PDF appears to be a scan. Use a text-searchable PDF; OCR is not included in this local build.")
                 return
             values = extract_certificate(text)
-            values.update({"Applicant business name": self.business_var.get(), "Applicant contact name": self.contact_var.get(), "Registered name": self.contact_var.get(), "Registered email": self.user_var.get(), "Registered mobile": self.mobile_var.get(), "Used by / trader contact": self.trader_contact_var.get(), "PAN number": self.pan_number.get(), "PAN date": self.pan_date.get()})
+            values.update({"Applicant business name": self.business_var.get(), "Applicant contact name": self.contact_var.get(), "Registered name": self.contact_var.get(), "Registered email": self.user_var.get(), "Registered mobile": self.mobile_var.get(), "Used by / trader contact": self.trader_contact_var.get(), "PAN name": self.pan_name.get(), "PAN number": self.pan_number.get(), "PAN date": self.pan_date.get(), "Repairer licence number": self.license_number.get()})
             self._set_fields(values)
             self.status.set(f"Draft prepared from {Path(path).name}. Review and correct every value before filling the portal.")
         except Exception as e:
@@ -810,31 +823,52 @@ class App(tk.Tk):
 
     def _load_profile(self):
         self.accounts = list(self.profile.get("portal_accounts", []))
+        legacy_pan = {
+            "pan_name": self.profile.get("pan_name", ""),
+            "pan_number": self.profile.get("pan_number", ""),
+            "pan_date": self.profile.get("pan_date", ""),
+            "pan_image_b64": self.profile.get("pan_image_b64", ""),
+            "pan_image_name": self.profile.get("pan_image_name", ""),
+        }
+        migrated = False
         if not self.accounts and self.profile.get("username") and self.profile.get("password"):
-            self.accounts = [{"label": self.profile.get("account_label") or self.profile.get("username"), "username": self.profile["username"], "password": self.profile["password"]}]
+            self.accounts = [{"username": self.profile["username"], "password": self.profile["password"], **legacy_pan}]
+            migrated = True
+        elif self.accounts and any(legacy_pan.values()):
+            # Older builds stored one shared PAN profile. Attach it to the first
+            # account once so it cannot leak across the other saved accounts.
+            for key, value in legacy_pan.items():
+                if value and not self.accounts[0].get(key):
+                    self.accounts[0][key] = value
+                    migrated = True
+        for key in ("username", "password", "account_label", "pan_name", "pan_number", "pan_date", "pan_image_b64", "pan_image_name"):
+            self.profile.pop(key, None)
+        self.profile["portal_accounts"] = self.accounts
         self._refresh_accounts(0 if self.accounts else None)
-        self.business_var.set(self.profile.get("applicant_business_name", "")); self.contact_var.set(self.profile.get("applicant_contact_name", "")); self.mobile_var.set(self.profile.get("applicant_mobile", "")); self.trader_contact_var.set(self.profile.get("trader_contact_name", ""))
-        self.pan_name.set(self.profile.get("pan_name", "")); self.pan_number.set(self.profile.get("pan_number", "")); self.pan_date.set(self.profile.get("pan_date", ""))
-        img = self.profile.get("pan_image_b64")
-        if img:
-            self.files["pan_image"] = "__encrypted_profile_image__"
-            self.files["pan_image_display"].set("Saved in encrypted profile")
+        self.business_var.set(self.profile.get("applicant_business_name", ""))
+        self.contact_var.set(self.profile.get("applicant_contact_name", ""))
+        self.mobile_var.set(self.profile.get("applicant_mobile", ""))
+        self.trader_contact_var.set(self.profile.get("trader_contact_name", ""))
+        if migrated:
+            try:
+                save_vault(self.profile)
+            except Exception as exc:
+                messagebox.showerror("Could not migrate saved account", str(exc))
 
     def _account_label(self, account):
-        label = account.get("label") or account.get("username", "Saved account")
-        email = account.get("username", "")
-        return f"{label} ({email})" if email and email not in label else label
+        return account.get("username", "")
 
     def _refresh_accounts(self, select_index=None):
-        values = [self._account_label(account) for account in getattr(self, "accounts", [])]
-        self.account_combo["values"] = values
-        if values:
-            index = select_index if select_index is not None and 0 <= select_index < len(values) else 0
+        self.account_combo["values"] = [self._account_label(account) for account in getattr(self, "accounts", [])]
+        if self.accounts:
+            index = select_index if select_index is not None and 0 <= select_index < len(self.accounts) else 0
             self.account_combo.current(index)
             self._on_account_selected()
         else:
             self.account_var.set("")
             self.user_var.set(""); self.pass_var.set("")
+            self.pan_name.set(""); self.pan_number.set(""); self.pan_date.set("")
+            self.license_number.set("")
 
     def _on_account_selected(self, _event=None):
         index = self.account_combo.current()
@@ -842,103 +876,131 @@ class App(tk.Tk):
             account = self.accounts[index]
             self.user_var.set(account.get("username", ""))
             self.pass_var.set(account.get("password", ""))
+            self.pan_name.set(account.get("pan_name", ""))
+            self.pan_number.set(account.get("pan_number", ""))
+            self.pan_date.set(account.get("pan_date", ""))
+            self.license_number.set(account.get("license_number", ""))
+            if self.vars:
+                self.vars["PAN name"].set(self.pan_name.get())
+                self.vars["PAN number"].set(self.pan_number.get())
+                self.vars["PAN date"].set(self.pan_date.get())
+                self.vars["Repairer licence number"].set(self.license_number.get())
 
-    def manage_credentials(self):
+    def add_account(self):
         window = tk.Toplevel(self)
-        window.title("Manage saved sign-ins")
+        window.title("Add portal account")
         window.transient(self)
         window.grab_set()
-        window.geometry("560x430")
+        window.geometry("540x690")
         pad = ttk.Frame(window, padding=18); pad.pack(fill="both", expand=True)
-        ttk.Label(pad, text="Saved portal accounts", style="Section.TLabel").pack(anchor="w")
-        account_list = tk.Listbox(pad, height=6, exportselection=False)
-        account_list.pack(fill="x", pady=(8, 12))
-        for account in self.accounts:
-            account_list.insert("end", self._account_label(account))
-        label_var = tk.StringVar(); email_var = tk.StringVar(); password_var = tk.StringVar()
+        ttk.Label(pad, text="Portal sign-in and matching PAN profile", style="Section.TLabel").pack(anchor="w")
+        ttk.Label(pad, text="All details and the PAN image are encrypted together for this email account.", background="#f3f6fa", foreground="#62738a", wraplength=480).pack(anchor="w", pady=(4, 12))
+
+        email_var = tk.StringVar(); password_var = tk.StringVar()
+        pan_name_var = tk.StringVar(); pan_number_var = tk.StringVar(); pan_date_var = tk.StringVar()
+        license_var = tk.StringVar(); image_label = tk.StringVar(value="No PAN image selected")
+        image_data = {"b64": "", "name": ""}
+        loaded_email = {"value": ""}
         fields = ttk.Frame(pad); fields.pack(fill="x")
-        for row, (label, var, secret) in enumerate((("Profile name", label_var, False), ("Registered email", email_var, False), ("Password", password_var, True))):
-            ttk.Label(fields, text=label).grid(row=row * 2, column=0, sticky="w", pady=(2, 1))
-            ttk.Entry(fields, textvariable=var, show="•" if secret else "").grid(row=row * 2 + 1, column=0, sticky="ew", pady=(0, 6))
+        entries = (
+            ("Registered email address", email_var, ""), ("Portal password", password_var, "•"),
+            ("Name on PAN card", pan_name_var, ""), ("PAN number", pan_number_var, ""),
+            ("Date on PAN card", pan_date_var, ""), ("License Number", license_var, ""),
+        )
+        email_entry = None
+        for row, (label, variable, show) in enumerate(entries):
+            ttk.Label(fields, text=label).grid(row=row * 2, column=0, sticky="w", pady=(3, 1))
+            entry = ttk.Entry(fields, textvariable=variable, show=show)
+            entry.grid(row=row * 2 + 1, column=0, sticky="ew", pady=(0, 5))
+            if variable is email_var:
+                email_entry = entry
         fields.columnconfigure(0, weight=1)
-        editing = {"index": None}
 
-        def load_selected(_event=None):
-            selection = account_list.curselection()
-            if not selection: return
-            editing["index"] = selection[0]
-            account = self.accounts[editing["index"]]
-            label_var.set(account.get("label", "")); email_var.set(account.get("username", "")); password_var.set(account.get("password", ""))
+        def choose_pan_image():
+            path = filedialog.askopenfilename(parent=window, filetypes=[("PAN card image", "*.jpg *.jpeg *.png"), ("All files", "*.*")])
+            if not path:
+                return
+            try:
+                content = Path(path).read_bytes()
+                if len(content) > 1024 * 1024:
+                    messagebox.showwarning("Image too large", "The portal accepts uploaded files up to 1 MB. Choose a smaller PAN image.", parent=window)
+                    return
+                image_data["b64"] = base64.b64encode(content).decode("ascii")
+                image_data["name"] = Path(path).name
+                image_label.set(Path(path).name)
+            except OSError as exc:
+                messagebox.showerror("Could not read PAN image", str(exc), parent=window)
 
-        def new_account():
-            editing["index"] = None
-            account_list.selection_clear(0, "end")
-            label_var.set(""); email_var.set(""); password_var.set("")
+        ttk.Label(pad, text="PAN card image", background="#f3f6fa").pack(anchor="w", pady=(8, 2))
+        image_row = ttk.Frame(pad); image_row.pack(fill="x")
+        ttk.Label(image_row, textvariable=image_label, foreground="#62738a").pack(side="left", fill="x", expand=True)
+        ttk.Button(image_row, text="Choose JPG / PNG", command=choose_pan_image).pack(side="right")
+
+        def load_existing(_event=None):
+            email = email_var.get().strip().casefold()
+            existing = next((item for item in self.accounts if item.get("username", "").casefold() == email), None)
+            if not existing:
+                if loaded_email["value"] and loaded_email["value"] != email:
+                    password_var.set(""); pan_name_var.set(""); pan_number_var.set("")
+                    pan_date_var.set(""); license_var.set("")
+                    image_data["b64"] = ""; image_data["name"] = ""
+                    image_label.set("No PAN image selected")
+                    loaded_email["value"] = ""
+                return
+            loaded_email["value"] = email
+            password_var.set(existing.get("password", ""))
+            pan_name_var.set(existing.get("pan_name", ""))
+            pan_number_var.set(existing.get("pan_number", ""))
+            pan_date_var.set(existing.get("pan_date", ""))
+            license_var.set(existing.get("license_number", ""))
+            image_data["b64"] = existing.get("pan_image_b64", "")
+            image_data["name"] = existing.get("pan_image_name", "")
+            image_label.set(image_data["name"] or "No PAN image selected")
+
+        email_entry.bind("<FocusOut>", load_existing)
 
         def save_account():
-            label, email, password = label_var.get().strip(), email_var.get().strip(), password_var.get()
-            if not label or not email or not password:
-                messagebox.showwarning("Missing sign-in details", "Enter a profile name, registered email, and password.", parent=window)
+            email, password = email_var.get().strip(), password_var.get()
+            if not email or not password:
+                messagebox.showwarning("Missing sign-in", "Enter the registered email and portal password.", parent=window)
                 return
-            record = {"label": label, "username": email, "password": password}
-            index = editing["index"]
-            if index is None:
-                self.accounts.append(record); index = len(self.accounts) - 1
+            if not pan_name_var.get().strip() or not pan_number_var.get().strip() or not pan_date_var.get().strip() or not image_data["b64"]:
+                messagebox.showwarning("PAN profile incomplete", "Enter the PAN name, number, and date, and choose a PAN card image.", parent=window)
+                return
+            old_accounts = self.accounts
+            match_index = next((i for i, item in enumerate(self.accounts) if item.get("username", "").casefold() == email.casefold()), None)
+            record = dict(self.accounts[match_index]) if match_index is not None else {}
+            record.update({
+                "username": email, "password": password,
+                "pan_name": pan_name_var.get().strip(), "pan_number": pan_number_var.get().strip(),
+                "pan_date": pan_date_var.get().strip(), "license_number": license_var.get().strip(),
+                "pan_image_b64": image_data["b64"], "pan_image_name": image_data["name"],
+            })
+            self.accounts = list(self.accounts)
+            if match_index is None:
+                self.accounts.append(record); match_index = len(self.accounts) - 1
             else:
-                self.accounts[index] = record
+                self.accounts[match_index] = record
             self.profile["portal_accounts"] = self.accounts
-            self.profile.pop("username", None); self.profile.pop("password", None)
             try:
                 save_vault(self.profile)
             except Exception as exc:
-                messagebox.showerror("Could not save sign-in", str(exc), parent=window)
+                self.accounts = old_accounts
+                self.profile["portal_accounts"] = old_accounts
+                messagebox.showerror("Could not save account", str(exc), parent=window)
                 return
-            self._refresh_accounts(index)
-            account_list.delete(0, "end")
-            for item in self.accounts: account_list.insert("end", self._account_label(item))
-            account_list.selection_set(index)
-            editing["index"] = index
-            self.status.set("Saved sign-in encrypted for this Windows account.")
+            self._refresh_accounts(match_index)
+            self.status.set(f"Saved encrypted account for {email}.")
+            window.destroy()
 
-        def delete_account():
-            index = editing["index"]
-            if index is None or not messagebox.askyesno("Remove saved sign-in", "Remove this sign-in from the encrypted profile?", parent=window): return
-            self.accounts.pop(index)
-            self.profile["portal_accounts"] = self.accounts
-            self.profile.pop("username", None); self.profile.pop("password", None)
-            try: save_vault(self.profile)
-            except Exception as exc:
-                messagebox.showerror("Could not update profile", str(exc), parent=window); return
-            account_list.delete(index)
-            _new = min(index, len(self.accounts) - 1) if self.accounts else None
-            self._refresh_accounts(_new)
-            new_account()
-
-        account_list.bind("<<ListboxSelect>>", load_selected)
-        buttons = ttk.Frame(pad); buttons.pack(fill="x", pady=(8, 0))
-        ttk.Button(buttons, text="New", command=new_account).pack(side="left")
-        ttk.Button(buttons, text="Save", command=save_account, style="Primary.TButton").pack(side="left", padx=8)
-        ttk.Button(buttons, text="Remove", command=delete_account).pack(side="left")
-        ttk.Button(buttons, text="Close", command=window.destroy).pack(side="right")
-        if self.accounts:
-            account_list.selection_set(0); load_selected()
-
-    def save_profile(self):
-        self.profile.update({"portal_accounts": getattr(self, "accounts", []), "applicant_business_name": self.business_var.get(), "applicant_contact_name": self.contact_var.get(), "applicant_mobile": self.mobile_var.get(), "trader_contact_name": self.trader_contact_var.get(), "pan_name": self.pan_name.get(), "pan_number": self.pan_number.get(), "pan_date": self.pan_date.get()})
-        self.profile.pop("username", None); self.profile.pop("password", None)
-        if not self.profile.get("pan_image_b64") and self.files.get("pan_image"):
-            self.profile["pan_image_b64"] = base64.b64encode(Path(self.files["pan_image"]).read_bytes()).decode("ascii")
-            self.profile["pan_image_name"] = Path(self.files["pan_image"]).name
-        try:
-            save_vault(self.profile)
-            self.status.set("Profile saved encrypted for this Windows account.")
-            messagebox.showinfo("Saved securely", "Credentials and PAN profile were saved in the local encrypted vault.")
-        except Exception as e: messagebox.showerror("Could not save profile", str(e))
+        buttons = ttk.Frame(pad); buttons.pack(fill="x", pady=(16, 0))
+        ttk.Button(buttons, text="Save account", command=save_account, style="Primary.TButton").pack(side="left")
+        ttk.Button(buttons, text="Cancel", command=window.destroy).pack(side="right")
 
     def open_portal(self):
         self._on_account_selected()
         if not self.user_var.get() or not self.pass_var.get():
-            messagebox.showwarning("Sign-in needed", "Choose a saved sign-in or add one with Manage saved sign-ins.")
+            messagebox.showwarning("Sign-in needed", "Choose an email from the dropdown or add an account.")
             return
         if not self.files.get("certificate"):
             messagebox.showwarning("Previous CV required", "Choose the previous CV PDF and read/review the draft before starting the application.")
@@ -962,24 +1024,25 @@ class App(tk.Tk):
 
     def _application_payload(self):
         fields = {k: v.get().strip() for k, v in self.vars.items()}
-        fields["PAN number"] = self.pan_number.get().strip() or fields.get("PAN number", "")
-        fields["PAN date"] = self.pan_date.get().strip() or fields.get("PAN date", "")
-        fields["Applicant business name"] = self.business_var.get().strip() or fields.get("Applicant business name", "")
-        fields["Applicant contact name"] = self.contact_var.get().strip() or fields.get("Applicant contact name", "")
-        fields["Registered name"] = self.contact_var.get().strip() or fields.get("Registered name", "")
+        fields["PAN name"] = fields.get("PAN name", "") or self.pan_name.get().strip()
+        fields["PAN number"] = fields.get("PAN number", "") or self.pan_number.get().strip()
+        fields["PAN date"] = fields.get("PAN date", "") or self.pan_date.get().strip()
+        fields["Repairer licence number"] = self.license_number.get().strip() or fields.get("Repairer licence number", "")
+        fields["Applicant business name"] = fields.get("Applicant business name", "") or self.business_var.get().strip()
+        fields["Applicant contact name"] = fields.get("Applicant contact name", "") or self.contact_var.get().strip()
+        fields["Registered name"] = fields.get("Registered name", "") or self.contact_var.get().strip()
         fields["Registered email"] = self.user_var.get().strip() or fields.get("Registered email", "")
-        fields["Registered mobile"] = self.mobile_var.get().strip() or fields.get("Registered mobile", "")
-        fields["Used by / trader contact"] = self.trader_contact_var.get().strip() or fields.get("Used by / trader contact", "")
+        fields["Registered mobile"] = fields.get("Registered mobile", "") or self.mobile_var.get().strip()
+        fields["Used by / trader contact"] = fields.get("Used by / trader contact", "") or self.trader_contact_var.get().strip()
         image_payload = None
-        if self.files.get("pan_image") == "__encrypted_profile_image__" or not self.files.get("pan_image"):
-            encoded = self.profile.get("pan_image_b64")
-            if encoded:
-                image_bytes = base64.b64decode(encoded)
-                image_name = self.profile.get("pan_image_name", "pan-card.jpg")
-                image_payload = {"name": image_name, "mimeType": mimetypes.guess_type(image_name)[0] or "image/jpeg", "buffer": image_bytes}
-        elif self.files.get("pan_image"):
-            image_payload = self.files["pan_image"]
-        return {"fields": fields, "certificate": self.files.get("certificate"), "repairer_license": self.files.get("repairer_license"), "authorization": self.files.get("authorization"), "pan_image_data": image_payload}
+        account_index = self.account_combo.current()
+        account = self.accounts[account_index] if 0 <= account_index < len(self.accounts) else {}
+        encoded = account.get("pan_image_b64")
+        if encoded:
+            image_bytes = base64.b64decode(encoded)
+            image_name = account.get("pan_image_name", "pan-card.jpg")
+            image_payload = {"name": image_name, "mimeType": mimetypes.guess_type(image_name)[0] or "image/jpeg", "buffer": image_bytes}
+        return {"fields": fields, "certificate": self.files.get("certificate"), "authorization": self.files.get("authorization"), "pan_image_data": image_payload}
 
     def submit_application(self):
         if not self.worker or not self.worker.is_alive():
