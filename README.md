@@ -22,7 +22,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\build.ps1
 ```
 
-The executable will be created at `dist\TN_Stamping_Assistant_v8.exe`. The build script downloads Python packages into `.build-deps`, downloads Chromium into `.pw-browsers`, and bundles both with PyInstaller. The app opens its own Chromium window and does not use installed Chrome. CAPTCHA completion is the only login step requiring your input.
+The executable will be created at `dist\TN_Stamping_Assistant_v9.exe`. The build script downloads Python packages into `.build-deps`, downloads Chromium into `.pw-browsers`, and bundles both with PyInstaller. The app opens its own Chromium window and does not use installed Chrome. CAPTCHA completion is the only login step requiring your input.
 
 To run from source instead:
 

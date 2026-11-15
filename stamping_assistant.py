@@ -230,6 +230,8 @@ class PortalWorker(threading.Thread):
         self.ready = threading.Event()
         self.pending_application = None
         self.last_captcha_value = ""
+        self.captcha_candidate_value = ""
+        self.captcha_candidate_since = 0.0
 
     def run(self):
         try:
@@ -375,6 +377,8 @@ class PortalWorker(threading.Thread):
         if user.input_value() != data["username"] or password.input_value() != data["password"]:
             raise RuntimeError("The portal did not accept the saved sign-in values in its login fields.")
         self.last_captcha_value = ""
+        self.captcha_candidate_value = ""
+        self.captcha_candidate_since = 0.0
 
     def _captcha_value(self):
         for frame in self.page.frames:
@@ -388,22 +392,37 @@ class PortalWorker(threading.Thread):
                     if re.search(r"captcha|verification\s+code|security\s+code|image\s+code", metadata):
                         value = field.input_value().strip()
                         if value:
-                            return value
+                            focused = field.evaluate("el => document.activeElement === el")
+                            return value, focused, False
                 for token in frame.locator('textarea[name="g-recaptcha-response"],textarea[name="h-captcha-response"]').all():
                     value = token.input_value().strip()
                     if value:
-                        return value
+                        return value, False, True
             except Exception:
                 continue
-        return ""
+        return "", False, False
 
     def _submit_login_after_captcha(self):
         """Submit only after the user has entered/completed the CAPTCHA."""
-        value = self._captcha_value()
+        value, field_focused, is_provider_token = self._captcha_value()
         if not value:
             self.last_captcha_value = ""
+            self.captcha_candidate_value = ""
+            self.captcha_candidate_since = 0.0
             return
         if value == self.last_captcha_value:
+            return
+        if value != self.captcha_candidate_value:
+            self.captcha_candidate_value = value
+            self.captcha_candidate_since = 0.0 if field_focused else time.monotonic()
+            return
+        if field_focused and not is_provider_token:
+            self.captcha_candidate_since = 0.0
+            return
+        if not self.captcha_candidate_since:
+            self.captcha_candidate_since = time.monotonic()
+            return
+        if time.monotonic() - self.captcha_candidate_since < 1.5:
             return
         for frame in self.page.frames:
             try:
@@ -420,7 +439,7 @@ class PortalWorker(threading.Thread):
                         continue
                     submit.click()
                 self.last_captcha_value = value
-                self.messages.put(("status", "CAPTCHA detected. Signing in and continuing automatically."))
+                self.messages.put(("status", "CAPTCHA entry is complete. Signing in and continuing automatically."))
                 return
             except Exception:
                 continue
