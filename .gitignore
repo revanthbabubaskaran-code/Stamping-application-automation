@@ -1,0 +1,7 @@
+.build-deps/
+.pw-browsers/
+build/
+dist/
+__pycache__/
+*.py[cod]
+Stamping list generator.exe
