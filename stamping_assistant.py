@@ -785,6 +785,12 @@ class PortalWorker(threading.Thread):
 
         if self.workflow_step <= 1:
             self._fill_items_and_previous_information(groups, machines, report["skipped"], report["filled"])
+            filled_items = set(report["filled"])
+            for index, _group in enumerate(groups, 1):
+                if f"Item category {index}" not in filled_items:
+                    report["required_blank"].append(f"Item category {index} was not selected")
+                if not any(entry.startswith(f"Item quantity {index}:") for entry in filled_items):
+                    report["required_blank"].append(f"Item quantity {index} total was not confirmed")
             self._collect_visible_required(report)
             if report["required_blank"]:
                 return report
@@ -1151,15 +1157,31 @@ class PortalWorker(threading.Thread):
                 break
             try:
                 add.click()
-                self.page.wait_for_timeout(450)
+                deadline = time.monotonic() + 8
+                updated = current
+                while time.monotonic() < deadline and updated <= current:
+                    self.page.wait_for_timeout(200)
+                    updated = count_fn()
             except Exception:
                 break
-            updated = count_fn()
             if updated <= current:
                 break
             current = updated
         if current < desired:
             skipped.append(f"{description}: portal has {current} row(s), needs {desired}; add missing row(s) manually")
+
+    def _repeater_section_scope(self, heading_pattern, control_selector):
+        """Find the smallest section ancestor containing both rows and its Add button."""
+        heading = self.page.get_by_text(re.compile(heading_pattern, re.I)).first
+        try:
+            if heading.count():
+                for depth in range(1, 10):
+                    scope = heading.locator("xpath=" + "/".join([".."] * depth))
+                    if scope.locator(control_selector).count() and self._add_button(scope) is not None:
+                        return scope
+        except Exception:
+            pass
+        return self._section_locator(heading_pattern)
 
     def _controls_matching(self, scope, pattern):
         matches = []
@@ -1204,8 +1226,9 @@ class PortalWorker(threading.Thread):
 
     def _fill_items_and_previous_information(self, groups, machines, skipped, filled):
         page = self.page
-        item_scope = self._section_locator(r"Items\s+to\s+be\s+verified")
-        categories = page.locator("select[id*='stampinglabourmeasures'][id$='stamping-type-id']")
+        category_selector = "select[id*='stampinglabourmeasures'][id$='stamping-type-id']:visible"
+        item_scope = self._repeater_section_scope(r"Items\s+to\s+be\s+verified", category_selector)
+        categories = page.locator(category_selector)
         self._ensure_repeater_count(lambda: categories.count(), len(groups), item_scope, "Item categories", skipped)
         category_controls = categories.all()
         for index, group in enumerate(groups):
