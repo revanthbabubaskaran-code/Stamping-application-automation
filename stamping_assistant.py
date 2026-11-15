@@ -106,7 +106,7 @@ LOCAL_ONLY_FIELDS = {
 }
 
 MACHINE_REVIEW_FIELDS = {
-    "Instrument description", "Denomination", "Instrument make", "Instrument model", "Machine number",
+    "Instrument description", "Denomination", "Weights", "Instrument make", "Instrument model", "Machine number",
     "Maximum capacity", "Minimum capacity", "Verification interval (e/d)", "Class", "Quantity",
 }
 
@@ -221,6 +221,7 @@ def _extract_machine_record(text: str, tables=None) -> dict[str, str]:
             record.update({
                 "Instrument description": _clean_cell(cells[0]),
                 "Denomination": _clean_cell(cells[2]),
+                "Weights": _clean_cell(cells[2]) if _is_weights_item(cells[0]) else "",
                 "Quantity": _clean_cell(cells[1]),
                 "Instrument make": first(r"Make\s*:\s*(.+?)(?=\s+Max\s*:|\s+Min\s*:|\s+e/d\s*:|$)", manufacturer),
                 "Maximum capacity": first(r"Max\s*:\s*(.+?)(?=\s+Min\s*:|\s+e/d\s*:|$)", manufacturer),
@@ -233,6 +234,11 @@ def _extract_machine_record(text: str, tables=None) -> dict[str, str]:
             })
             for key in ("Instrument make", "Maximum capacity", "Minimum capacity", "Verification interval (e/d)", "Machine number"):
                 record[key] = _clean_cell(record[key])
+            if _is_weights_item(record.get("Instrument description", "")):
+                record["Weights"] = record.get("Denomination", "")
+                for key in ("Instrument make", "Maximum capacity", "Minimum capacity", "Verification interval (e/d)", "Instrument model", "Machine number"):
+                    record[key] = ""
+                record["Class"] = ""
             return record
     # Text-only fallback; keep each field bounded so adjacent table columns cannot leak into it.
     record.update({
@@ -246,7 +252,14 @@ def _extract_machine_record(text: str, tables=None) -> dict[str, str]:
         "Class": first(r"\bClass\s+(III|IIII|II|IV|I)\b", text),
         "Quantity": first(r"(?:\n|Items\s+)\s*(\d{1,3})\s+\d+(?:\s*[a-zA-Z]+)?\s+-", text),
     })
+    if _is_weights_item(record.get("Instrument description", "")):
+        record["Weights"] = first(r"\b(\d+(?:\.\d+)?\s*(?:kg|g))\.?\b", text)
     return record
+
+
+def _is_weights_item(description: str) -> bool:
+    normalized = normalize_text(description)
+    return "iron hexagonal knob type weights" in normalized and "parallelepiped weights" in normalized
 
 
 def _clean_cell(value: str) -> str:
@@ -263,7 +276,7 @@ def extract_certificate_document(path: str) -> tuple[int, int, dict[str, str], l
     first_machine_page = None
     for page in pages:
         machine = _extract_machine_record(page["text"], page["tables"])
-        if machine.get("Machine number") or machine.get("Instrument make"):
+        if machine.get("Machine number") or machine.get("Instrument make") or _is_weights_item(machine.get("Instrument description", "")):
             machine["Previous CV number"] = first(r"CV\s*No\.?\s*:\s*([^\n]+)", page["text"])
             machine["Application number"] = first(r"Application\s+Number\s*:\s*([^\n]+)", page["text"])
             machine["Additional fee"] = first(r"50%\s+Additional\s+Fee\s*:\s*([\d,.]+)", page["text"]) or machine.get("Additional fee", "")
@@ -771,6 +784,9 @@ class PortalWorker(threading.Thread):
                 if locator is None or not locator.count() or not locator.first.is_visible():
                     report["skipped"].append(f"{field} (control not found or not visible)")
                     continue
+                if not locator.first.is_editable():
+                    report["skipped"].append(f"{field} (read-only; populated by the portal)")
+                    continue
                 top = locator.first.evaluate("el => el.getBoundingClientRect().top")
                 actions.append((float(top), field, locator.first, value, "field"))
             except Exception as exc:
@@ -912,10 +928,10 @@ class PortalWorker(threading.Thread):
                 if locator.evaluate("el => el.tagName.toLowerCase()") == "select":
                     selected = self._select_best(locator, value)
                     if not selected and field in {"District", "Taluk", "Town / Village", "Street", "Weighing machine capacity range"}:
-                        deadline = time.monotonic() + 12
+                        deadline = time.monotonic() + 25
                         while time.monotonic() < deadline and not selected:
                             page.wait_for_timeout(300)
-                            if locator.is_enabled():
+                            if locator.is_enabled() and locator.evaluate("el => !el.options || el.options.length > 1"):
                                 selected = self._select_best(locator, value)
                     if not selected:
                         report["skipped"].append(f"{field} (no matching enabled option for {value})")
@@ -926,7 +942,7 @@ class PortalWorker(threading.Thread):
                 if field == "Repairer licence number":
                     page.wait_for_timeout(1400)
                 elif field in {"State", "District", "Taluk", "Town / Village", "Street"}:
-                    page.wait_for_timeout(600)
+                    page.wait_for_timeout(1200 if field in {"District", "Taluk"} else 700)
                 report["filled"].append(field)
             except Exception as exc:
                 report["skipped"].append(f"{field}: {exc}")
@@ -1027,7 +1043,7 @@ class PortalWorker(threading.Thread):
     def _collect_visible_required(self, report):
         try:
             blank = self.page.locator("input[required]:visible,select[required]:visible,textarea[required]:visible").evaluate_all(
-                "els => els.filter(e => (e.type === 'checkbox' || e.type === 'radio') ? !e.checked : !e.value).map(e => e.id || e.name || e.type)"
+                "els => els.filter(e => !e.disabled && !e.readOnly && ((e.type === 'checkbox' || e.type === 'radio') ? !e.checked : !e.value)).map(e => e.id || e.name || e.type)"
             )
             report["required_blank"] = list(dict.fromkeys(report["required_blank"] + blank))
             report["skipped"].extend(f"Required field left blank: {name}" for name in blank if f"Required field left blank: {name}" not in report["skipped"])
@@ -1130,6 +1146,18 @@ class PortalWorker(threading.Thread):
             try:
                 if self._fill_control(category_controls[index], group["description"]):
                     filled.append(f"Item category {index + 1}")
+                    if _is_weights_item(group["description"]):
+                        weight = next((machine.get("Weights", "") or machine.get("Denomination", "") for machine in group.get("machines", []) if machine.get("Weights") or machine.get("Denomination")), "")
+                        if weight:
+                            page.wait_for_timeout(350)
+                            try:
+                                row_scope = category_controls[index].locator("xpath=ancestor::tr[1]")
+                                weight_controls = self._controls_matching(row_scope, r"weight|denomination") if row_scope.count() else []
+                                weight_control = next((control for control in weight_controls if control != category_controls[index] and control.is_visible()), None)
+                                if weight_control and self._fill_control(weight_control, weight):
+                                    filled.append(f"Item weights {index + 1}: {weight}")
+                            except Exception:
+                                pass
                 else:
                     skipped.append(f"Item category {index + 1}: {group['description']}")
                 element_id = category_controls[index].get_attribute("id") or ""
@@ -1196,6 +1224,7 @@ class PortalWorker(threading.Thread):
 
     def _fill_machine_detail_tables(self, groups, machines, skipped, filled):
         page = self.page
+        weights_only = bool(machines) and all(_is_weights_item(row.get("Instrument description", "")) for row in machines)
         tables = []
         try:
             for table in page.locator("table").all():
@@ -1205,7 +1234,8 @@ class PortalWorker(threading.Thread):
                 for row in rows[:3]:
                     cells = row.locator("th,td").all_inner_texts()
                     joined = self._norm(" ".join(cells))
-                    if sum(bool(re.search(pattern, joined, re.I)) for pattern in (r"denomination|weight", r"class", r"max", r"min", r"e\s*d|division", r"make|manufacturer", r"model", r"machine|serial")) >= 3:
+                    has_weight_column = bool(re.search(r"denomination|weight", joined, re.I))
+                    if sum(bool(re.search(pattern, joined, re.I)) for pattern in (r"denomination|weight", r"class", r"max", r"min", r"e\s*d|division", r"make|manufacturer", r"model", r"machine|serial")) >= 3 or (weights_only and has_weight_column):
                         header_row, headers = row, cells
                         break
                 if header_row is None:
@@ -1275,9 +1305,11 @@ class PortalWorker(threading.Thread):
                 field = next((name for name, pattern in pattern_map.items() if re.search(pattern, header, re.I)), None)
                 if not field:
                     continue
-                value = machine.get(field, "")
+                value = machine.get("Weights", "") or machine.get("Denomination", "") if field == "Denomination" else machine.get(field, "")
                 if field == "Previous CV number":
                     value = machine.get("Previous CV number", "")
+                if _is_weights_item(machine.get("Instrument description", "")) and field not in {"Denomination", "Previous CV number"}:
+                    continue
                 controls = cell.locator("input,select,textarea")
                 if not value or not controls.count():
                     continue
@@ -1359,7 +1391,7 @@ class PortalWorker(threading.Thread):
             skipped.append(f"Portal machine rows: found {len(indices)} for {len(rows)} PDF machine(s); add the remaining row(s) manually")
 
         field_patterns = {
-            "Denomination": r"\b(weight|denomination)\b",
+            "Weights": r"\b(weight|denomination)\b",
             "Instrument make": r"\b(make|manufacturer|brand)\b",
             "Maximum capacity": r"\b(max(?:imum)?|capacity max)\b",
             "Minimum capacity": r"\b(min(?:imum)?|capacity min)\b",
@@ -1395,6 +1427,10 @@ class PortalWorker(threading.Thread):
                     label = control.evaluate("el => [...(el.labels || [])].map(x => x.innerText).join(' ')")
                     metadata = self._norm(" ".join(filter(None, [element_id, control.get_attribute("name"), control.get_attribute("placeholder"), control.get_attribute("aria-label"), label])))
                     field = next((key for key, pattern in field_patterns.items() if re.search(pattern, metadata, re.I)), None)
+                    if field == "Weights" and not _is_weights_item(row.get("Instrument description", "")):
+                        field = None
+                    if _is_weights_item(row.get("Instrument description", "")) and field not in {"Weights", None}:
+                        continue
                     value = row.get(field, "") if field else ""
                     if not value:
                         continue
@@ -1690,11 +1726,11 @@ class App(tk.Tk):
         self.machine_metadata = []
         first_idx = 0
         machine_keys = [
-            "Denomination", "Instrument description", "Instrument make", "Maximum capacity", "Minimum capacity",
+            "Weights", "Instrument description", "Instrument make", "Maximum capacity", "Minimum capacity",
             "Verification interval (e/d)", "Instrument model", "Machine number", "Class", "Quantity",
         ]
         machine_headers = {
-            "Denomination": "Weight", "Instrument description": "Instrument type", "Instrument make": "Make",
+            "Weights": "Weights", "Instrument description": "Instrument type", "Instrument make": "Make",
             "Maximum capacity": "Max", "Minimum capacity": "Min",
             "Verification interval (e/d)": "e/d", "Instrument model": "Model",
             "Machine number": "Machine number", "Class": "Class", "Quantity": "Qty",
