@@ -262,6 +262,12 @@ def _is_weights_item(description: str) -> bool:
     return "iron hexagonal knob type weights" in normalized and "parallelepiped weights" in normalized
 
 
+def _item_count(value: str) -> int:
+    """Use the printed count, or one unit for each distinct certificate row."""
+    match = re.search(r"\d+", str(value or ""))
+    return int(match.group(0)) if match else 1
+
+
 def _clean_cell(value: str) -> str:
     value = (value or "").replace("–", "-").replace("—", "-").replace("−", "-").replace("�", " ")
     cleaned = re.sub(r"\s+", " ", value).strip(" .,:;\n")
@@ -805,10 +811,7 @@ class PortalWorker(threading.Thread):
             if not key:
                 continue
             group = groups.setdefault(key, {"description": description, "quantity": 0, "machines": []})
-            try:
-                group["quantity"] += int(row.get("Quantity") or 0)
-            except ValueError:
-                pass
+            group["quantity"] += _item_count(row.get("Quantity", ""))
             group["machines"].append(row)
         return list(groups.values())
 
@@ -1211,6 +1214,9 @@ class PortalWorker(threading.Thread):
             try:
                 if self._fill_control(category_controls[index], group["description"]):
                     filled.append(f"Item category {index + 1}")
+                    # Category changes can reset quantity asynchronously; wait
+                    # for that update before applying the sum of its PDF rows.
+                    page.wait_for_timeout(400)
                     if _is_weights_item(group["description"]):
                         weight = next((machine.get("Weights", "") or machine.get("Denomination", "") for machine in group.get("machines", []) if machine.get("Weights") or machine.get("Denomination")), "")
                         if weight:
@@ -1230,8 +1236,15 @@ class PortalWorker(threading.Thread):
                 row_index = int(row_match.group(1)) if row_match else index
                 quantity = page.locator(f"#stampinglabourmeasures-{row_index}-quantity")
                 if quantity.count():
-                    quantity.fill(str(group["quantity"]))
-                    filled.append(f"Item quantity {index + 1}")
+                    total_quantity = sum(_item_count(machine.get("Quantity", "")) for machine in group.get("machines", []))
+                    quantity.fill(str(total_quantity))
+                    page.wait_for_timeout(150)
+                    if quantity.input_value().strip() != str(total_quantity):
+                        quantity.fill(str(total_quantity))
+                    if quantity.input_value().strip() == str(total_quantity):
+                        filled.append(f"Item quantity {index + 1}: {total_quantity}")
+                    else:
+                        skipped.append(f"Item quantity {index + 1}: expected total {total_quantity}, portal shows {quantity.input_value().strip()}")
                 else:
                     skipped.append(f"Item quantity {index + 1}")
             except Exception:
@@ -2137,10 +2150,7 @@ class App(tk.Tk):
             if not key:
                 continue
             group = grouped.setdefault(key, {"description": description, "quantity": 0, "machines": []})
-            try:
-                group["quantity"] += int(row.get("Quantity") or 0)
-            except ValueError:
-                pass
+            group["quantity"] += _item_count(row.get("Quantity", ""))
             group["machines"].append(row)
         return {"fields": fields, "machine_rows": machine_rows, "item_groups": list(grouped.values()), "certificate": self.files.get("certificate"), "authorization": self.files.get("authorization"), "pan_image_data": image_payload}
 
