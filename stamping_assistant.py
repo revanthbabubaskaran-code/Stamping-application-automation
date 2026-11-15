@@ -765,6 +765,7 @@ class PortalWorker(threading.Thread):
                 if not self._select_best(new_goods, new_goods_choice):
                     report["skipped"].append("New goods / machine type choice")
                 else:
+                    report["filled"].append("New goods / machine type choice")
                     page.wait_for_timeout(350)
             except Exception as exc:
                 report["skipped"].append(f"New goods / machine type choice: {exc}")
@@ -784,9 +785,41 @@ class PortalWorker(threading.Thread):
                     report["skipped"].append(f"{field} (control not found or not visible)")
                     continue
                 top = locator.first.evaluate("el => el.getBoundingClientRect().top")
-                actions.append((float(top), field, locator.first, value))
+                actions.append((float(top), field, locator.first, value, "field"))
             except Exception as exc:
                 report["skipped"].append(f"{field} (could not locate control: {exc})")
+
+        checkbox = self._same_details_checkbox()
+        if checkbox is not None:
+            try:
+                top = checkbox.evaluate("el => el.getBoundingClientRect().top")
+                actions.append((float(top), "Same Details for Manufacturer / Trader / Establishment", checkbox, True, "checkbox"))
+            except Exception as exc:
+                report["skipped"].append(f"Same Details checkbox: {exc}")
+        else:
+            report["skipped"].append("Same Details for Manufacturer / Trader / Establishment (checkbox not found)")
+
+        applicant_name = fields.get("Applicant / establishment name", "")
+        manufacturer_scope = self._section_locator(r"Manufacturer\s*/\s*Trader\s*/\s*Establishment")
+        establishment_controls = [control for control in self._controls_matching(manufacturer_scope, r"establishment\s*name")
+                                  if (control.get_attribute("id") or "").lower() != "establishmentname"]
+        if applicant_name and establishment_controls:
+            control = establishment_controls[0]
+            try:
+                actions.append((float(control.evaluate("el => el.getBoundingClientRect().top")), "Manufacturer / Trader establishment name", control, applicant_name, "field"))
+            except Exception as exc:
+                report["skipped"].append(f"Manufacturer / Trader establishment name: {exc}")
+        elif applicant_name:
+            report["skipped"].append("Manufacturer / Trader establishment name (control not found)")
+
+        used_by = page.locator("#trader-name")
+        if used_by.count():
+            try:
+                actions.append((float(used_by.first.evaluate("el => el.getBoundingClientRect().top")), "Repaired by / Used by", used_by.first, "", "license-establishment"))
+            except Exception as exc:
+                report["skipped"].append(f"Repaired by / Used by: {exc}")
+        else:
+            report["skipped"].append("Repaired by / Used by (control not found)")
 
         special_choices = [
             ("Stamping purpose: Re-verification", "#stamping-intend", "Re-verification"),
@@ -799,14 +832,64 @@ class PortalWorker(threading.Thread):
             try:
                 if locator.count() and locator.first.is_visible():
                     top = locator.first.evaluate("el => el.getBoundingClientRect().top")
-                    actions.append((float(top), label, locator.first, value))
+                    actions.append((float(top), label, locator.first, value, "field"))
                 else:
                     report["skipped"].append(f"{label} (control not found or not visible)")
             except Exception as exc:
                 report["skipped"].append(f"{label} (could not locate control: {exc})")
 
-        for _top, field, locator, value in sorted(actions, key=lambda action: action[0]):
+        attachments = [
+            ("Upload the purchase Invoice/Previous CV", "#pur-invo-file", payload.get("certificate")),
+            ("Upload the Authorisation Letter from the user/owner", "#repairerletter", payload.get("authorization")),
+            ("Upload copy of PAN card", "#pancard-file", payload.get("pan_image_data")),
+        ]
+        for label, selector, file_path in attachments:
+            if not file_path:
+                continue
+            locator = page.locator(selector)
             try:
+                if not locator.count():
+                    report["skipped"].append(f"Upload: {label} (control not found)")
+                    continue
+                top = locator.first.evaluate("""el => {
+                    const label = el.id ? document.querySelector('label[for="' + CSS.escape(el.id) + '"]') : null;
+                    const container = el.closest('.form-group,.form-row,.row') || el.parentElement;
+                    return (label || container || el).getBoundingClientRect().top;
+                }""")
+                actions.append((float(top), label, locator.first, file_path, "upload"))
+            except Exception as exc:
+                report["skipped"].append(f"Upload: {label}: {exc}")
+
+        same_details_checked = False
+        for _top, field, locator, value, action_type in sorted(actions, key=lambda action: action[0]):
+            try:
+                if action_type == "checkbox":
+                    if not locator.is_checked():
+                        locator.check()
+                    same_details_checked = locator.is_checked()
+                    if same_details_checked:
+                        report["filled"].append(field)
+                    else:
+                        report["skipped"].append(field)
+                    continue
+                if action_type == "license-establishment":
+                    license_establishment = page.locator("#establishmentname")
+                    license_name = license_establishment.input_value().strip() if license_establishment.count() else ""
+                    value = license_name or fields.get("Used by / trader contact", "")
+                    if not value:
+                        report["skipped"].append("Repaired by / Used by (license establishment name unavailable)")
+                        continue
+                if action_type == "upload":
+                    if isinstance(value, dict):
+                        if len(value.get("buffer", b"")) > 1024 * 1024:
+                            report["skipped"].append(f"{field} exceeds the portal's 1 MB file limit")
+                        else:
+                            locator.set_input_files(value); report["uploaded"].append(field)
+                    elif Path(value).stat().st_size > 1024 * 1024:
+                        report["skipped"].append(f"{field} exceeds the portal's 1 MB file limit")
+                    else:
+                        locator.set_input_files(value); report["uploaded"].append(field)
+                    continue
                 if locator.evaluate("el => el.tagName.toLowerCase()") == "select":
                     selected = self._select_best(locator, value)
                     if not selected and field in {"District", "Taluk", "Town / Village", "Street", "Weighing machine capacity range"}:
@@ -836,42 +919,19 @@ class PortalWorker(threading.Thread):
             else:
                 report["filled"].append("Site Dormant / Other choice")
 
-        same_details_checked = self._check_same_details()
-        if not same_details_checked:
-            report["skipped"].append("Same Details for Manufacturer / Trader / Establishment (checkbox not found or unchecked)")
-        applicant_name = fields.get("Applicant / establishment name", "")
-        manufacturer_scope = self._section_locator(r"Manufacturer\s*/\s*Trader\s*/\s*Establishment")
-        establishment_controls = [control for control in self._controls_matching(manufacturer_scope, r"establishment\s*name")
-                                  if (control.get_attribute("id") or "").lower() != "establishmentname"]
-        if applicant_name and establishment_controls:
-            try:
-                establishment_controls[0].fill(applicant_name)
-                report["filled"].append("Manufacturer / Trader establishment name")
-            except Exception as exc:
-                report["skipped"].append(f"Manufacturer / Trader establishment name: {exc}")
-        elif applicant_name:
-            report["skipped"].append("Manufacturer / Trader establishment name (control not found)")
-
-        license_establishment = page.locator("#establishmentname")
-        used_by = page.locator("#trader-name")
-        if used_by.count():
-            try:
-                license_name = license_establishment.input_value().strip() if license_establishment.count() else ""
-                license_name = license_name or fields.get("Used by / trader contact", "")
-                if license_name:
-                    used_by.fill(license_name)
-                    report["filled"].append("Repaired by / Used by")
-                else:
-                    report["skipped"].append("Repaired by / Used by (license establishment name unavailable)")
-            except Exception as exc:
-                report["skipped"].append(f"Repaired by / Used by: {exc}")
-
         critical_fields = (
             "Applicant / establishment name", "Stamping office/site", "Repairer licence number", "Repairer name",
             "Previous CV number", "Previous CV date", "State", "District", "Taluk", "Town / Village",
             "Street", "Door number", "Pincode", "PAN name", "PAN number", "PAN date",
         )
         filled_names = set(report["filled"])
+        for field in ("New goods / machine type choice", "Stamping purpose: Re-verification", "Applicant licence type: Repairer"):
+            if field not in filled_names:
+                report["required_blank"].append(f"Portal choice not selected: {field}")
+        if new_goods_choice == "Electronic" and "Weighing machine capacity range" not in filled_names:
+            report["required_blank"].append("Portal choice not selected: Weighing machine capacity range")
+        if fields.get("Stamping office/site", "").lower() == "site" and "Site Dormant / Other choice" not in filled_names:
+            report["required_blank"].append("Portal choice not selected: Site Dormant / Other")
         for field in critical_fields:
             if fields.get(field) and field not in filled_names:
                 report["required_blank"].append(f"Portal field not filled: {field}")
@@ -881,39 +941,9 @@ class PortalWorker(threading.Thread):
             report["required_blank"].append("Portal field not filled: Repaired by / Used by")
         if not same_details_checked:
             report["required_blank"].append("Portal checkbox not selected: Same Details for Manufacturer / Trader / Establishment")
-
-        # Upload the first-page attachments after the matching fields are ready.
-        attachments = [
-            ("Upload the purchase Invoice/Previous CV", "#pur-invo-file", payload.get("certificate")),
-            ("Upload the Authorisation Letter from the user/owner", "#repairerletter", payload.get("authorization")),
-            ("Upload copy of PAN card", "#pancard-file", payload.get("pan_image_data")),
-        ]
-        upload_actions = []
-        for label, selector, file_path in attachments:
-            if not file_path:
-                continue
-            try:
-                locator = page.locator(selector)
-                if not locator.count():
-                    report["skipped"].append(f"Upload: {label} (control not found)")
-                    continue
-                top = locator.first.evaluate("el => el.getBoundingClientRect().top")
-                upload_actions.append((float(top), label, locator.first, file_path))
-            except Exception:
-                report["skipped"].append(f"Upload: {label} (control not found)")
-        for _top, label, locator, file_path in sorted(upload_actions, key=lambda action: action[0]):
-            try:
-                if isinstance(file_path, dict):
-                    if len(file_path.get("buffer", b"")) > 1024 * 1024:
-                        report["skipped"].append(f"{label} exceeds the portal's 1 MB file limit")
-                    else:
-                        locator.set_input_files(file_path); report["uploaded"].append(label)
-                elif Path(file_path).stat().st_size > 1024 * 1024:
-                    report["skipped"].append(f"{label} exceeds the portal's 1 MB file limit")
-                else:
-                    locator.set_input_files(file_path); report["uploaded"].append(label)
-            except Exception as exc:
-                report["skipped"].append(f"Upload: {label}: {exc}")
+        for label, _selector, file_path in attachments:
+            if file_path and label not in report["uploaded"]:
+                report["required_blank"].append(f"Portal upload not completed: {label}")
 
     @staticmethod
     def _capacity_kg(value: str) -> float:
@@ -928,24 +958,29 @@ class PortalWorker(threading.Thread):
             return number / 1000
         return number
 
-    def _check_same_details(self):
+    def _same_details_checkbox(self):
         try:
             checkbox = self.page.get_by_label(re.compile(r"Same Details for Manufacturer\s*/\s*Trader\s*/\s*Establishment", re.I)).first
             if checkbox.count():
-                if not checkbox.is_checked():
-                    checkbox.check()
-                return checkbox.is_checked()
+                return checkbox
         except Exception:
             # Fall back to checkbox labels whose text includes the requested phrase.
             for label in self.page.locator("label").all():
                 try:
                     if re.search(r"Same Details for Manufacturer\s*/\s*Trader\s*/\s*Establishment", label.inner_text(), re.I):
                         control = label.locator("input[type=checkbox]").first
-                        if control.count() and not control.is_checked(): control.check()
-                        return control.count() and control.is_checked()
+                        if control.count(): return control
                 except Exception:
                     continue
-        return False
+        return None
+
+    def _check_same_details(self):
+        checkbox = self._same_details_checkbox()
+        if checkbox is None:
+            return False
+        if not checkbox.is_checked():
+            checkbox.check()
+        return checkbox.is_checked()
 
     def _click_next(self, expected_page):
         page = self.page
@@ -1058,6 +1093,11 @@ class PortalWorker(threading.Thread):
                 except Exception:
                     continue
             return False
+        if kind == "date":
+            date_match = re.fullmatch(r"(\d{1,2})[-/](\d{1,2})[-/](\d{4})", str(value).strip())
+            if date_match:
+                day, month, year = date_match.groups()
+                value = f"{year}-{int(month):02d}-{int(day):02d}"
         control.fill(value)
         return True
 
