@@ -791,6 +791,12 @@ class PortalWorker(threading.Thread):
                     report["required_blank"].append(f"Item category {index} was not selected")
                 if not any(entry.startswith(f"Item quantity {index}:") for entry in filled_items):
                     report["required_blank"].append(f"Item quantity {index} total was not confirmed")
+                if f"Previous Information Online {index}" not in filled_items:
+                    report["required_blank"].append(f"Previous Information Online option for machine {index} was not selected")
+                if f"Previous Information Application number {index}" not in filled_items:
+                    report["required_blank"].append(f"Previous Information Application number for machine {index} was not filled")
+                if f"Previous Information Certificate number {index}" not in filled_items:
+                    report["required_blank"].append(f"Previous Information Certificate number for machine {index} was not filled")
             self._collect_visible_required(report)
             if report["required_blank"]:
                 return report
@@ -1273,52 +1279,120 @@ class PortalWorker(threading.Thread):
             except Exception:
                 skipped.append(f"Item category/quantity {index + 1}")
 
-        previous_scope = self._section_locator(r"Previous\s+Information")
+        previous_scope = self._repeater_section_scope(r"Previous\s+Information", "select:visible")
         app_pattern = r"application\s*(?:number|no\b)"
         cv_pattern = r"(?:certificate|previous\s*cv|cv)\s*(?:number|no\b)"
         model_pattern = r"\bmodel\s*(?:name)?\b"
-        def previous_fields():
-            return (self._controls_matching(previous_scope, app_pattern),
-                    self._controls_matching(previous_scope, cv_pattern),
-                    self._controls_matching(previous_scope, model_pattern))
-        apps, cvs, models = previous_fields()
-        while min(len(apps), len(cvs), len(models)) < len(machines):
-            add = self._add_button(previous_scope)
-            if add is None:
-                break
-            try:
-                add.click(); page.wait_for_timeout(450)
-            except Exception:
-                break
-            new_apps, new_cvs, new_models = previous_fields()
-            if min(len(new_apps), len(new_cvs), len(new_models)) <= min(len(apps), len(cvs), len(models)):
-                break
-            apps, cvs, models = new_apps, new_cvs, new_models
-        if not self._fill_online_choice(previous_scope):
-            skipped.append("Previous Information: Online option")
+        def online_controls():
+            controls = []
+            for control in previous_scope.locator("select:visible").all():
+                try:
+                    options = [self._norm(option.inner_text()) for option in control.locator("option").all()]
+                    if any(label == "online" or "online other state" in label for label in options):
+                        controls.append(control)
+                except Exception:
+                    continue
+            return controls
+
+        def wait_for_count(getter, required, timeout=12):
+            deadline = time.monotonic() + timeout
+            current = getter()
+            while len(current) < required and time.monotonic() < deadline:
+                page.wait_for_timeout(250)
+                current = getter()
+            return current
+
+        states = wait_for_count(online_controls, 1)
+        if not states:
+            skipped.append("Previous Information: Online/Other State control not found")
+            return
+
         for index, machine in enumerate(machines):
+            states = online_controls()
+            if index == 0:
+                state_control = states[0] if states else None
+            else:
+                model_index = index - 1
+                models = self._controls_matching(previous_scope, model_pattern)
+                if len(models) <= model_index and len(states) <= index:
+                    add = self._add_button(previous_scope)
+                    if add is not None:
+                        try:
+                            add.click()
+                            page.wait_for_timeout(350)
+                        except Exception as exc:
+                            skipped.append(f"Previous Information: could not add machine section {index + 1}: {exc}")
+                    else:
+                        skipped.append(f"Previous Information: Add More control not found for machine {index + 1}")
+                    deadline = time.monotonic() + 10
+                    while time.monotonic() < deadline:
+                        models = self._controls_matching(previous_scope, model_pattern)
+                        states = online_controls()
+                        if len(models) > model_index or len(states) > index:
+                            break
+                        page.wait_for_timeout(250)
+
+                models = self._controls_matching(previous_scope, model_pattern)
+                if len(models) > model_index:
+                    model_control = models[model_index]
+                    model_value = machine.get("Instrument description", "")
+                    selected_model = self._select_best(model_control, model_value)
+                    if not selected_model:
+                        selected_model = self._select_first_available(model_control)
+                    if selected_model:
+                        filled.append(f"Previous Information Model {index + 1}")
+                    else:
+                        skipped.append(f"Previous Information Model for machine {index + 1}")
+                    states = wait_for_count(online_controls, index + 1)
+                state_control = states[index] if len(states) > index else None
+
+            if state_control is None or not self._select_best(state_control, "Online"):
+                skipped.append(f"Previous Information Online option for machine {index + 1}")
+                continue
+            filled.append(f"Previous Information Online {index + 1}")
+            page.wait_for_timeout(350)
+
+            apps = wait_for_count(lambda: self._controls_matching(previous_scope, app_pattern), index + 1)
+            cvs = wait_for_count(lambda: self._controls_matching(previous_scope, cv_pattern), index + 1)
             app_no = machine.get("Application number", "")
             cv_no = machine.get("Previous CV number", "")
-            model = machine.get("Instrument description", "")
-            for label, controls, value in (("Application number", apps, app_no), ("Certificate number", cvs, cv_no), ("Model name", models, model)):
-                if index >= len(controls):
+            for label, controls, value in (("Application number", apps, app_no), ("Certificate number", cvs, cv_no)):
+                if index >= len(controls) or not value:
                     skipped.append(f"Previous Information {label} for machine {index + 1}")
                     continue
                 try:
-                    if value and self._fill_control(controls[index], value):
+                    control = controls[index]
+                    if self._fill_control(control, value) and self._field_value_matches(control, value):
                         filled.append(f"Previous Information {label} {index + 1}")
                     else:
-                        skipped.append(f"Previous Information {label} for machine {index + 1}")
-                except Exception:
-                    skipped.append(f"Previous Information {label} for machine {index + 1}")
+                        skipped.append(f"Previous Information {label} for machine {index + 1} (value did not persist)")
+                except Exception as exc:
+                    skipped.append(f"Previous Information {label} for machine {index + 1}: {exc}")
 
-    def _fill_online_choice(self, scope):
+            # Certificate date is computed by the portal after both identifiers.
+            dates = self._controls_matching(previous_scope, r"certificate\s*date|previous\s*cv\s*date")
+            if index < len(dates):
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    try:
+                        if dates[index].input_value().strip():
+                            break
+                    except Exception:
+                        break
+                    page.wait_for_timeout(300)
+
+    def _select_first_available(self, control):
         try:
-            for select in scope.locator("select").all():
-                for option in select.locator("option").all():
-                    if self._norm(option.inner_text()) == "online":
-                        select.select_option(value=option.get_attribute("value"))
-                        return True
+            for option in control.locator("option").all():
+                label = re.sub(r"\s+", " ", option.inner_text()).strip()
+                value = option.get_attribute("value")
+                if not label or value is None or label.lower() in {"select", "please select"} or option.get_attribute("disabled") is not None:
+                    continue
+                try:
+                    control.select_option(value=value)
+                    return True
+                except Exception:
+                    continue
         except Exception:
             pass
         return False
