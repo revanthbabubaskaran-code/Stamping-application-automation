@@ -15,6 +15,7 @@ import threading
 import mimetypes
 import sys
 import time
+import winreg
 from difflib import SequenceMatcher
 import tkinter as tk
 from ctypes import wintypes
@@ -45,6 +46,7 @@ FIELD_LABELS = {
     "Pincode": ["pincode", "pin code", "postal code"],
     "Previous CV number": ["previous cv number", "cv number", "certificate number", "previous verification certificate number", "previous certificate number"],
     "Previous CV date": ["previous cv date", "certificate date", "date of verification", "verification date"],
+    "Application number": ["application number", "application no"],
     "Instrument description": ["type of weighing instrument", "weighing instrument", "instrument type", "description of instrument", "type of instrument"],
     "Instrument make": ["make", "manufacturer", "make of instrument"],
     "Instrument model": ["model", "model of instrument"],
@@ -68,6 +70,7 @@ FIELD_LABELS = {
     "Stamping office/site": ["whether stamping office or site"],
     "Trader / establishment number": ["manufacturer trader establishment number", "trader number"],
     "Used by / trader contact": ["repaired by used by", "used by"],
+    "Dormant / Other": ["dormant", "other"],
 }
 
 PORTAL_IDS = {
@@ -86,7 +89,6 @@ PORTAL_IDS = {
     "PAN number": "#pan-number",
     "PAN date": "#pan-date",
     "Quantity": "#stampinglabourmeasures-0-quantity",
-    "Applicant business name": "#establishmentname",
     "Applicant contact name": "#applicant-name",
     "Registered name": "#userlogname",
     "Registered email": "#userlogemail",
@@ -99,12 +101,12 @@ PORTAL_IDS = {
 }
 
 LOCAL_ONLY_FIELDS = {
-    "Business address", "Instrument make", "Instrument model", "Machine number",
-    "Maximum capacity", "Minimum capacity", "Verification interval (e/d)", "Class",
+    "Business address", "Denomination", "Instrument make", "Instrument model", "Machine number",
+    "Maximum capacity", "Minimum capacity", "Verification interval (e/d)", "Class", "Application number", "Dormant / Other",
 }
 
 MACHINE_REVIEW_FIELDS = {
-    "Instrument description", "Instrument make", "Instrument model", "Machine number",
+    "Instrument description", "Denomination", "Instrument make", "Instrument model", "Machine number",
     "Maximum capacity", "Minimum capacity", "Verification interval (e/d)", "Class", "Quantity",
 }
 
@@ -178,12 +180,111 @@ def pdf_text(path: str) -> str:
         return "\n".join(page.extract_text() or "" for page in pdf.pages)
 
 
+def normalize_text(value: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+    return re.sub(r"(?<=\d)\s+(?=[a-z])", "", normalized)
+
+
+def read_certificate_pages(path: str) -> tuple[int, list[dict]]:
+    """Read page text and table cells, omitting pages with only the TCPDF footer."""
+    try:
+        import pdfplumber
+    except ImportError as exc:
+        raise RuntimeError("PDF reading module is missing. Reinstall using the included setup instructions.") from exc
+    result = []
+    with pdfplumber.open(path) as pdf:
+        page_count = len(pdf.pages)
+        for page_number, page in enumerate(pdf.pages, 1):
+            text = page.extract_text() or ""
+            tables = page.extract_tables() or []
+            meaningful = re.sub(r"(?im)^\s*powered\s+by\s+tcpdf.*$", "", text).strip()
+            meaningful = re.sub(r"(?m)^\s*\d+\s*/\s*\d+\s*$", "", meaningful).strip()
+            if meaningful or any(str(cell or "").strip() for table in tables for row in table for cell in row):
+                result.append({"page_number": page_number, "text": text, "tables": tables})
+    return page_count, result
+
+
 def first(pattern: str, text: str, flags=re.I | re.S) -> str:
     match = re.search(pattern, text, flags)
     return re.sub(r"\s+", " ", match.group(1)).strip(" .,:;\n") if match else ""
 
 
-def extract_certificate(text: str) -> dict[str, str]:
+def _extract_machine_record(text: str, tables=None) -> dict[str, str]:
+    """Read one weighing instrument row from a certificate table when available."""
+    record = {name: "" for name in MACHINE_REVIEW_FIELDS}
+    for table in tables or []:
+        for row in table:
+            cells = [str(cell or "") for cell in row]
+            if len(cells) < 9 or not re.search(r"machine\s*(?:no|number)|make\s*:", " ".join(cells), re.I):
+                continue
+            manufacturer, model_cell, number_cell = cells[6], cells[7], cells[8]
+            record.update({
+                "Instrument description": _clean_cell(cells[0]),
+                "Denomination": _clean_cell(cells[2]),
+                "Quantity": _clean_cell(cells[1]),
+                "Instrument make": first(r"Make\s*:\s*(.+?)(?=\s+Max\s*:|\s+Min\s*:|\s+e/d\s*:|$)", manufacturer),
+                "Maximum capacity": first(r"Max\s*:\s*(.+?)(?=\s+Min\s*:|\s+e/d\s*:|$)", manufacturer),
+                "Minimum capacity": first(r"Min\s*:\s*(.+?)(?=\s+e/d\s*:|$)", manufacturer),
+                "Verification interval (e/d)": first(r"e/d\s*:\s*(.+?)\s*$", manufacturer),
+                "Instrument model": _clean_cell(first(r"Model\s*:\s*(.+)$", model_cell)),
+                "Machine number": first(r"Machine\s*(?:No\.?|Number)\s*:\s*(.+)$", number_cell),
+                "Class": _clean_cell(cells[5]),
+                "Additional fee": first(r"50%\s+Additional\s+Fee\s*:\s*([\d,.]+)", cells[9]) if len(cells) > 9 else "",
+            })
+            for key in ("Instrument make", "Maximum capacity", "Minimum capacity", "Verification interval (e/d)", "Machine number"):
+                record[key] = _clean_cell(record[key])
+            return record
+    # Text-only fallback; keep each field bounded so adjacent table columns cannot leak into it.
+    record.update({
+        "Instrument description": first(r"((?:Non-)?Automatic\s+.+?Class\s+(?:III|IIII|II|IV))\s*(?:\(|\n)", text),
+        "Instrument make": first(r"Make\s*:\s*([^\n]+?)(?=\s+Max\s*:|\s+Min\s*:|\s+e/d\s*:|\s+Model\b|\s+Machine\s+No|$)", text),
+        "Instrument model": first(r"Model\s*:\s*([^\n]+)", text),
+        "Machine number": first(r"Machine\s+No\.?\s*:\s*([^\n]+)", text),
+        "Maximum capacity": first(r"Max\s*:\s*([^\n]+?)(?=\s+Min\s*:|\s+e/d\s*:|$)", text),
+        "Minimum capacity": first(r"Min\s*:\s*([^\n]+?)(?=\s+e/d\s*:|$)", text),
+        "Verification interval (e/d)": first(r"e/d\s*:\s*([^\n]+)", text),
+        "Class": first(r"\bClass\s+(III|IIII|II|IV|I)\b", text),
+        "Quantity": first(r"(?:\n|Items\s+)\s*(\d{1,3})\s+\d+(?:\s*[a-zA-Z]+)?\s+-", text),
+    })
+    return record
+
+
+def _clean_cell(value: str) -> str:
+    value = (value or "").replace("–", "-").replace("—", "-").replace("−", "-").replace("�", " ")
+    cleaned = re.sub(r"\s+", " ", value).strip(" .,:;\n")
+    cleaned = re.sub(r"(?i)\bnon-\s+automatic\b", "Non-Automatic", cleaned)
+    cleaned = re.sub(r"\(\s+", "(", cleaned)
+    return re.sub(r"\bweigh\s+t\b", "weight", cleaned, flags=re.I)
+
+
+def extract_certificate_document(path: str) -> tuple[int, int, dict[str, str], list[dict[str, str]]]:
+    page_count, pages = read_certificate_pages(path)
+    machines = []
+    first_machine_page = None
+    for page in pages:
+        machine = _extract_machine_record(page["text"], page["tables"])
+        if machine.get("Machine number") or machine.get("Instrument make"):
+            machine["Previous CV number"] = first(r"CV\s*No\.?\s*:\s*([^\n]+)", page["text"])
+            machine["Application number"] = first(r"Application\s+Number\s*:\s*([^\n]+)", page["text"])
+            machine["Additional fee"] = first(r"50%\s+Additional\s+Fee\s*:\s*([\d,.]+)", page["text"]) or machine.get("Additional fee", "")
+            machine["Stamping office/site"] = first(r"Stamping\s+at\s+(Office|Site)", page["text"])
+            if first_machine_page is None:
+                first_machine_page = page
+            machines.append(machine)
+    if not machines or first_machine_page is None:
+        raise RuntimeError("No machine table was found in the PDF. Use a text-searchable previous CV or check the document.")
+    values = extract_certificate(first_machine_page["text"], first_machine_page["tables"])
+    values.update(machines[0])
+    values["Repairer name"] = ""  # Filled from the selected PAN profile in the UI.
+    if values.get("Stamping office/site", "").lower() == "site":
+        fees = [re.sub(r"[^\d.]", "", row.get("Additional fee", "")) for row in machines]
+        values["Dormant / Other"] = "Dormant" if fees and all(fee and float(fee) == 0 for fee in fees) else "Other"
+    else:
+        values["Dormant / Other"] = ""
+    return page_count, len(pages), values, machines
+
+
+def extract_certificate(text: str, tables=None) -> dict[str, str]:
     """Best-effort extraction. Never invent a value; unresolved fields stay blank."""
     values = {
         "Previous CV number": first(r"CV\s*No\.?\s*:\s*([^\n]+)", text),
@@ -207,16 +308,20 @@ def extract_certificate(text: str) -> dict[str, str]:
     values["Business address"] = raw_address
     values["State"] = "Tamil Nadu" if re.search(r"Tamil\s*Nadu", text, re.I) else ""
     parts = [p.strip() for p in raw_address.split(",") if p.strip()]
-    values["Door number"] = parts[0] if parts and re.match(r"\d", parts[0]) else ""
     taluk_at = next((i for i, part in enumerate(parts) if re.search(r"\btaluk\b", part, re.I)), -1)
     values["Taluk"] = re.sub(r"\s*taluk\s*", "", parts[taluk_at], flags=re.I).strip() if taluk_at >= 0 else ""
     values["District"] = parts[taluk_at + 1] if taluk_at >= 0 and len(parts) > taluk_at + 1 else ""
     values["Town / Village"] = parts[taluk_at - 1] if taluk_at > 0 else ""
+    values["Street"] = parts[taluk_at - 2] if taluk_at > 2 else ""
+    values["Door number"] = ", ".join(parts[:taluk_at - 2]) if taluk_at > 2 else ""
     values["Pincode"] = first(r"\b(\d{6})\b", raw_address)
-    street_candidates = [p for p in parts[1:taluk_at - 1] if re.search(r"road|street|salai|main", p, re.I)] if taluk_at > 1 else []
-    values["Street"] = street_candidates[-1] if street_candidates else ""
+    if not values["Street"]:
+        street_candidates = [p for p in parts[1:taluk_at - 1] if re.search(r"road|street|salai|main", p, re.I)] if taluk_at > 1 else []
+        values["Street"] = street_candidates[-1] if street_candidates else ""
     values["Repairer licence date"] = first(r"Licence Number\s*:\s*[^\n]*?(\d{2}[-/]\d{2}[-/]\d{4})", text)
+    values["Repairer business name"] = first(r"Repaired by\s+(.+?)(?:,\s*\d|\n)", text)
     values["Trader / establishment number"] = first(r"Trader\s+No\.?\s*:\s*\n\s*([^\n]+)", text)
+    values.update(_extract_machine_record(text, tables))
     return values
 
 
@@ -229,6 +334,10 @@ class PortalWorker(threading.Thread):
         self.page = None
         self.ready = threading.Event()
         self.pending_application = None
+        self.ready_for_submit = False
+        self.workflow_step = 0
+        self.waiting_for_login = False
+        self.login_attempt_at = 0.0
         self.last_captcha_value = ""
         self.captcha_candidate_value = ""
         self.captcha_candidate_since = 0.0
@@ -237,12 +346,14 @@ class PortalWorker(threading.Thread):
         try:
             from playwright.sync_api import sync_playwright
         except ImportError:
+            self.ready.set()
             self.messages.put(("error", "Playwright is not installed. Follow README setup/build steps."))
             return
         with sync_playwright() as pw:
             try:
                 browser = pw.chromium.launch(headless=False)
             except Exception as e:
+                self.ready.set()
                 self.messages.put(("error", f"Could not start the app's Chromium browser. Rebuild the app with the bundled browser.\n{e}"))
                 return
             context = browser.new_context()
@@ -253,21 +364,32 @@ class PortalWorker(threading.Thread):
                 try:
                     cmd, payload = self.commands.get(timeout=0.5)
                 except queue.Empty:
+                    if self.waiting_for_login:
+                        if self._logged_in():
+                            self.waiting_for_login = False
+                            self.login_attempt_at = 0.0
+                            self.messages.put(("login_ok", "Portal sign-in succeeded. Continue with Fill now / retry when the PDF draft is ready."))
+                        else:
+                            self._submit_login_after_captcha()
+                            self._report_login_failure_if_due()
+                        continue
                     if self.pending_application is not None:
                         if not self._logged_in():
                             self._submit_login_after_captcha()
+                            self._report_login_failure_if_due()
                             continue
                         application = self.pending_application
                         self.pending_application = None
+                        self.login_attempt_at = 0.0
                         try:
-                            self._navigate_to_stamping_form()
                             report = self._fill_form(application)
                             report["automatic"] = True
                             self.messages.put(("details", report))
                             if report["required_blank"]:
                                 self.messages.put(("error", "The form is filled, but required fields remain blank. Complete those fields in the app browser; the application was not submitted."))
                             else:
-                                self._submit()
+                                self.ready_for_submit = True
+                                self.messages.put(("ready_to_submit", "The application pages are filled through the final review page. Review them in the app browser, then use Submit to complete the application."))
                         except Exception as e:
                             self.messages.put(("error", f"Login was detected, but the automatic form steps stopped safely: {e}"))
                     continue
@@ -275,16 +397,27 @@ class PortalWorker(threading.Thread):
                     break
                 try:
                     if cmd == "open":
-                        self.pending_application = payload["application"]
+                        self.pending_application = payload.get("application")
+                        self.waiting_for_login = True
+                        self.ready_for_submit = False
+                        self.workflow_step = 0
                         self._open_login_page()
                         self._fill_login(payload["credentials"])
-                        self.messages.put(("opened", "Saved email and password filled. Enter the CAPTCHA in the app browser; the app will click Login and finish the application flow."))
+                        self.messages.put(("opened", "Portal opened in bundled Chromium and saved sign-in filled. Enter the CAPTCHA there; the application will continue automatically if a PDF draft is ready."))
                     elif cmd == "fill":
-                        report = self._fill_form(payload)
-                        if report["required_blank"]:
-                            self.messages.put(("error", "The form is filled, but required fields remain blank. Complete those fields in the app browser; the application was not submitted."))
+                        if not self._logged_in():
+                            self.pending_application = payload
+                            self.waiting_for_login = True
+                            self._open_login_page()
+                            self._fill_login(payload.get("credentials", {}))
+                            self.messages.put(("opened", "Portal opened in bundled Chromium. Enter the CAPTCHA; login and application filling will continue automatically."))
                         else:
-                            self._submit()
+                            report = self._fill_form(payload)
+                            if report["required_blank"]:
+                                self.messages.put(("error", "The form is filled, but required fields remain blank. Complete those fields in the app browser; the application was not submitted."))
+                            else:
+                                self.ready_for_submit = True
+                                self.messages.put(("ready_to_submit", "The application pages are filled through the final review page. Review them in the app browser, then use Submit to complete the application."))
                     elif cmd == "submit":
                         self._submit()
                     elif cmd == "credentials":
@@ -334,6 +467,8 @@ class PortalWorker(threading.Thread):
             self.start()
             if not self.ready.wait(8):
                 raise RuntimeError("Browser automation could not start.")
+            if not self.is_alive():
+                raise RuntimeError("Browser automation exited before Chromium became ready. Check the error shown in the app.")
         self.commands.put((cmd, payload))
 
     def _login_controls(self):
@@ -445,10 +580,45 @@ class PortalWorker(threading.Thread):
                         continue
                     submit.click()
                 self.last_captcha_value = value
+                self.login_attempt_at = time.monotonic()
                 self.messages.put(("status", "CAPTCHA entry is complete. Signing in and continuing automatically."))
                 return
             except Exception:
                 continue
+
+    def _report_login_failure_if_due(self):
+        if not self.login_attempt_at or time.monotonic() - self.login_attempt_at < 15:
+            return
+        self.login_attempt_at = 0.0
+        diagnostic = self._login_error_text()
+        detail = f" Portal message: {diagnostic}" if diagnostic else " No readable portal error message was found."
+        self.messages.put(("login_failed", "Sign-in was not confirmed after Login. Check the saved email/password with Edit credentials, then retry; the CAPTCHA may have expired or been rejected." + detail))
+
+    def _login_error_text(self) -> str:
+        """Read short, visible validation messages without collecting page contents or field values."""
+        candidates = []
+        selectors = (
+            '[role="alert"]', '.alert', '.alert-danger', '.error', '.error-message',
+            '.invalid-feedback', '.validation-summary-errors', '[aria-invalid="true"] + *',
+        )
+        for frame in self.page.frames:
+            for selector in selectors:
+                try:
+                    for item in frame.locator(selector).all()[:8]:
+                        if not item.is_visible():
+                            continue
+                        text = re.sub(r"\s+", " ", item.inner_text(timeout=700)).strip()
+                        if 3 <= len(text) <= 220 and text.lower() not in {value.lower() for value in candidates}:
+                            candidates.append(text)
+                except Exception:
+                    continue
+        # Never echo an email address from a portal validation message into the app log.
+        safe = []
+        for text in candidates:
+            text = re.sub(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", "[email hidden]", text, flags=re.I)
+            if any(word in text.lower() for word in ("invalid", "incorrect", "captcha", "verification", "expired", "locked", "failed", "error", "required", "denied")):
+                safe.append(text)
+        return "; ".join(safe[:3])
 
     def _logged_in(self) -> bool:
         page = self.page
@@ -494,7 +664,7 @@ class PortalWorker(threading.Thread):
 
     @staticmethod
     def _norm(s: str) -> str:
-        return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+        return normalize_text(s)
 
     def _field_for(self, names):
         page = self.page
@@ -522,89 +692,593 @@ class PortalWorker(threading.Thread):
         return None
 
     def _fill_form(self, payload):
-        page = self.page
         self._navigate_to_stamping_form()
-        filled, skipped = [], []
-        for field, value in payload["fields"].items():
-            if not value:
+        self.ready_for_submit = False
+        report = {"filled": [], "skipped": [], "uploaded": [], "required_blank": []}
+        fields = payload["fields"]
+        machines = payload.get("machine_rows") or [fields]
+        groups = payload.get("item_groups") or self._group_items(machines)
+
+        if self.workflow_step <= 0:
+            self._fill_establishment_page(fields, machines, payload, report)
+            self._collect_visible_required(report)
+            if report["required_blank"]:
+                return report
+            self._click_next("item and previous-information page")
+            self.workflow_step = 1
+
+        if self.workflow_step <= 1:
+            self._fill_items_and_previous_information(groups, machines, report["skipped"], report["filled"])
+            self._collect_visible_required(report)
+            if report["required_blank"]:
+                return report
+            self._click_next("machine-details page")
+            self.workflow_step = 2
+
+        if self.workflow_step <= 2:
+            self._fill_machine_detail_tables(groups, machines, report["skipped"], report["filled"])
+            self._collect_visible_required(report)
+            if report["required_blank"]:
+                return report
+            self._click_next("final application page")
+            self.workflow_step = 3
+        self._collect_visible_required(report)
+        return report
+
+    @staticmethod
+    def _group_items(machines):
+        groups = {}
+        for row in machines:
+            description = row.get("Instrument description", "")
+            key = PortalWorker._norm(description)
+            if not key:
                 continue
-            if field == "Instrument description":
+            group = groups.setdefault(key, {"description": description, "quantity": 0, "machines": []})
+            try:
+                group["quantity"] += int(row.get("Quantity") or 0)
+            except ValueError:
+                pass
+            group["machines"].append(row)
+        return list(groups.values())
+
+    def _fill_establishment_page(self, fields, machines, payload, report):
+        page = self.page
+        address_order = ["State", "District", "Taluk", "Town / Village", "Street"]
+        deferred = set(address_order + ["Door number", "Pincode"])
+        for field, value in fields.items():
+            if not value or field in LOCAL_ONLY_FIELDS or field in deferred or field in {"Instrument description", "Applicant business name"}:
                 continue
-            if field in LOCAL_ONLY_FIELDS:
-                continue
-            selector = PORTAL_IDS.get(field)
-            locator = page.locator(selector) if selector else self._field_for(FIELD_LABELS.get(field, [field]))
+            locator = page.locator(PORTAL_IDS[field]) if field in PORTAL_IDS else self._field_for(FIELD_LABELS.get(field, [field]))
             if locator is None:
-                skipped.append(field)
+                report["skipped"].append(field)
                 continue
             try:
+                if field in {"Registered name", "Registered email", "Registered mobile", "Applicant contact name", "Repairer licence date"}:
+                    if locator.evaluate("el => !!el.value"):
+                        continue
                 tag = locator.evaluate("el => el.tagName.toLowerCase()")
                 if tag == "select":
                     if not self._select_best(locator, value):
-                        skipped.append(field)
+                        report["skipped"].append(field)
                         continue
-                    page.wait_for_timeout(350)
                 else:
                     locator.fill(value)
-                filled.append(field)
+                if field == "Repairer licence number":
+                    page.wait_for_timeout(1200)
+                report["filled"].append(field)
             except Exception:
-                skipped.append(field)
+                report["skipped"].append(field)
 
-        # The portal's required choice fields are not represented in the PDF draft.
-        description = payload["fields"].get("Instrument description", "")
-        low = description.lower()
-        machine_kind = "Electronic" if "electronic" in low else "Mechanical" if "mechanical" in low else "Weighing"
-        if not self._select_best(page.locator("#newgood"), machine_kind): skipped.append("Instrument technology (portal choice)")
-        capacity = payload["fields"].get("Maximum capacity", "")
-        cap_number = self._number(capacity)
-        capacity_choice = "Below 3 tonnes" if cap_number and cap_number < 3000 else "Above 3 tonnes" if cap_number else ""
-        if capacity_choice and not self._select_best(page.locator("#tonnes"), capacity_choice): skipped.append("Capacity range (portal choice)")
-        route = "Re-verification" if payload["fields"].get("Previous CV number") else "New verification"
-        if not self._select_best(page.locator("#stamping-intend"), route): skipped.append("Stamping purpose (portal choice)")
-        if payload["fields"].get("Repairer licence number"):
-            if not self._select_best(page.locator("#applicant-licence-id"), "Repairer"):
-                skipped.append("Licensed applicant type (portal choice)")
-        item = payload["fields"].get("Instrument description", "")
-        if item and not self._select_best(page.locator("#stampinglabourmeasures-0-stamping-type-id"), item):
-            skipped.append("Instrument item category")
+        for field in address_order + ["Door number", "Pincode"]:
+            value = fields.get(field, "")
+            if not value:
+                continue
+            locator = page.locator(PORTAL_IDS[field]) if field in PORTAL_IDS else self._field_for(FIELD_LABELS.get(field, [field]))
+            if locator is None:
+                report["skipped"].append(field)
+                continue
+            try:
+                selected = self._select_best(locator, value) if locator.evaluate("el => el.tagName.toLowerCase()") == "select" else False
+                if locator.evaluate("el => el.tagName.toLowerCase()") == "select" and not selected:
+                    deadline = time.monotonic() + 10
+                    while time.monotonic() < deadline and not selected:
+                        page.wait_for_timeout(300)
+                        selected = self._select_best(locator, value)
+                elif locator.evaluate("el => el.tagName.toLowerCase()") != "select":
+                    locator.fill(value)
+                    selected = True
+                if not selected:
+                    report["skipped"].append(field)
+                    continue
+                report["filled"].append(field)
+                if field in {"State", "District", "Taluk", "Town / Village", "Street"}:
+                    page.wait_for_timeout(650)
+            except Exception:
+                report["skipped"].append(field)
 
+        self._check_same_details()
+        applicant_name = fields.get("Applicant / establishment name", "")
+        manufacturer_scope = self._section_locator(r"Manufacturer\s*/\s*Trader\s*/\s*Establishment")
+        establishment_controls = [control for control in self._controls_matching(manufacturer_scope, r"establishment\s*name")
+                                  if (control.get_attribute("id") or "").lower() != "establishmentname"]
+        if applicant_name and establishment_controls:
+            try:
+                establishment_controls[0].fill(applicant_name)
+                report["filled"].append("Manufacturer / Trader establishment name")
+            except Exception:
+                report["skipped"].append("Manufacturer / Trader establishment name")
+        elif applicant_name:
+            report["skipped"].append("Manufacturer / Trader establishment name")
+
+        license_establishment = page.locator("#establishmentname")
+        used_by = page.locator("#trader-name")
+        if used_by.count():
+            try:
+                license_name = license_establishment.input_value().strip() if license_establishment.count() else ""
+                license_name = license_name or fields.get("Used by / trader contact", "")
+                if license_name:
+                    used_by.fill(license_name)
+                    report["filled"].append("Repaired by / Used by")
+                else:
+                    report["skipped"].append("Repaired by / Used by (license establishment name unavailable)")
+            except Exception:
+                report["skipped"].append("Repaired by / Used by")
+
+        machine_kinds = {
+            "Electronic" if "electronic" in row.get("Instrument description", "").lower()
+            else "Mechanical" if "mechanical" in row.get("Instrument description", "").lower()
+            else "Other"
+            for row in machines if row.get("Instrument description")
+        }
+        new_goods_choice = next(iter(machine_kinds)) if len(machine_kinds) == 1 else "Other"
+        if not self._select_best(page.locator("#newgood"), new_goods_choice):
+            report["skipped"].append("New goods / machine type choice")
+        if new_goods_choice == "Electronic":
+            electronic_max = max((self._capacity_kg(row.get("Maximum capacity", "")) for row in machines if "electronic" in row.get("Instrument description", "").lower()), default=0)
+            capacity_choice = "Above 3 tonnes" if electronic_max > 3000 else "Below 3 tonnes"
+            if not self._select_best(page.locator("#tonnes"), capacity_choice):
+                # The dependent choice may appear only after selecting Electronic.
+                page.wait_for_timeout(500)
+                if not self._select_best(page.locator("#tonnes"), capacity_choice):
+                    report["skipped"].append("Weighing machine capacity range")
+        if not self._select_best(page.locator("#stamping-intend"), "Re-verification"):
+            report["skipped"].append("Stamping purpose: Re-verification")
+        if not self._select_best(page.locator("#applicant-licence-id"), "Repairer"):
+            report["skipped"].append("Applicant licence type: Repairer")
+        if fields.get("Stamping office/site", "").lower() == "site":
+            dormant = self._field_for(["Dormant / Other", "Dormant / other", "Dormant"])
+            if dormant is None or not self._select_best(dormant, fields.get("Dormant / Other", "Other")):
+                report["skipped"].append("Site Dormant / Other choice")
+
+        # Documents are uploaded on the establishment page before proceeding.
         attachments = [
             ("Upload the purchase Invoice/Previous CV", "#pur-invo-file", payload.get("certificate")),
             ("Upload the Authorisation Letter from the user/owner", "#repairerletter", payload.get("authorization")),
             ("Upload copy of PAN card", "#pancard-file", payload.get("pan_image_data")),
         ]
-        uploaded = []
         for label, selector, file_path in attachments:
             if not file_path:
                 continue
             locator = page.locator(selector) if selector else self._file_input_for(label)
-            if locator:
-                if isinstance(file_path, dict):
+            try:
+                if not locator:
+                    report["skipped"].append(f"Upload: {label}")
+                elif isinstance(file_path, dict):
                     if len(file_path.get("buffer", b"")) > 1024 * 1024:
-                        skipped.append(f"{label} exceeds the portal's 1 MB file limit")
-                        continue
-                    locator.set_input_files(file_path)
+                        report["skipped"].append(f"{label} exceeds the portal's 1 MB file limit")
+                    else:
+                        locator.set_input_files(file_path); report["uploaded"].append(label)
+                elif Path(file_path).stat().st_size > 1024 * 1024:
+                    report["skipped"].append(f"{label} exceeds the portal's 1 MB file limit")
                 else:
-                    if Path(file_path).stat().st_size > 1024 * 1024:
-                        skipped.append(f"{label} exceeds the portal's 1 MB file limit")
-                        continue
-                    locator.set_input_files(file_path)
-                uploaded.append(label)
-            else:
-                skipped.append(f"Upload: {label}")
-        required_blank = []
-        # Required controls that remain empty are reported and block auto-submit.
+                    locator.set_input_files(file_path); report["uploaded"].append(label)
+            except Exception:
+                report["skipped"].append(f"Upload: {label}")
+
+    @staticmethod
+    def _capacity_kg(value: str) -> float:
+        numbers = [float(n.replace(",", "")) for n in re.findall(r"\d[\d,]*(?:\.\d+)?", value or "")]
+        if not numbers:
+            return 0
+        number = max(numbers)
+        low = (value or "").lower()
+        if re.search(r"\b(tonnes?|tons?|t)\b", low):
+            return number * 1000
+        if re.search(r"\bgrams?|\bg\b", low):
+            return number / 1000
+        return number
+
+    def _check_same_details(self):
         try:
-            blank_required = page.locator("input[required],select[required],textarea[required]").evaluate_all(
-                "els => els.filter(e => (e.type === 'checkbox' || e.type === 'radio') ? !e.checked : !e.value).map(e => e.id || e.name || e.type)"
-            )
-            required_blank = blank_required
-            skipped.extend(f"Required field left blank: {name}" for name in blank_required)
+            checkbox = self.page.get_by_label(re.compile(r"Same Details for Manufacturer\s*/\s*Trader\s*/\s*Establishment", re.I)).first
+            if checkbox.count() and not checkbox.is_checked():
+                checkbox.check()
+        except Exception:
+            # Fall back to checkbox labels whose text includes the requested phrase.
+            for label in self.page.locator("label").all():
+                try:
+                    if re.search(r"Same Details for Manufacturer\s*/\s*Trader\s*/\s*Establishment", label.inner_text(), re.I):
+                        control = label.locator("input[type=checkbox]").first
+                        if control.count() and not control.is_checked(): control.check()
+                        return
+                except Exception:
+                    continue
+
+    def _click_next(self, expected_page):
+        page = self.page
+        next_button = page.get_by_role("button", name=re.compile(r"\bnext\b", re.I)).last
+        if not next_button.count():
+            next_button = page.get_by_role("link", name=re.compile(r"\bnext\b", re.I)).last
+        if not next_button.count():
+            next_button = page.locator('input[type="button"][value*="Next" i],input[type="submit"][value*="Next" i]').last
+        if not next_button.count() or not next_button.is_visible():
+            raise RuntimeError(f"Could not find the Next control for the {expected_page}. Review the current portal page.")
+        next_button.click()
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=10000)
         except Exception:
             pass
-        report = {"filled": filled, "skipped": skipped, "uploaded": uploaded, "required_blank": required_blank}
-        self.messages.put(("details", report))
-        return report
+        page.wait_for_timeout(700)
+
+    def _collect_visible_required(self, report):
+        try:
+            blank = self.page.locator("input[required]:visible,select[required]:visible,textarea[required]:visible").evaluate_all(
+                "els => els.filter(e => (e.type === 'checkbox' || e.type === 'radio') ? !e.checked : !e.value).map(e => e.id || e.name || e.type)"
+            )
+            report["required_blank"] = list(dict.fromkeys(report["required_blank"] + blank))
+            report["skipped"].extend(f"Required field left blank: {name}" for name in blank if f"Required field left blank: {name}" not in report["skipped"])
+        except Exception:
+            pass
+
+    def _section_locator(self, heading_text):
+        page = self.page
+        heading = page.get_by_text(re.compile(heading_text, re.I)).first
+        try:
+            if heading.count():
+                for depth in range(1, 8):
+                    scope = heading.locator("xpath=" + "/".join([".."] * depth))
+                    if scope.locator("input,select,textarea,button,a,[role='button']").count():
+                        return scope
+        except Exception:
+            pass
+        return page.locator("body")
+
+    def _add_button(self, scope):
+        try:
+            for control in scope.locator("button,a,[role='button'],input[type='button']").all():
+                if not control.is_visible():
+                    continue
+                label = " ".join(filter(None, [control.inner_text(timeout=500), control.get_attribute("value"), control.get_attribute("aria-label"), control.get_attribute("title")]))
+                if re.fullmatch(r"\s*(?:\+\s*)?(?:add|add more|add another|add new|add new item|add more item|add row)\s*", label, re.I):
+                    return control
+        except Exception:
+            pass
+        return None
+
+    def _ensure_repeater_count(self, count_fn, desired, scope, description, skipped):
+        current = count_fn()
+        while current < desired:
+            add = self._add_button(scope)
+            if add is None:
+                break
+            try:
+                add.click()
+                self.page.wait_for_timeout(450)
+            except Exception:
+                break
+            updated = count_fn()
+            if updated <= current:
+                break
+            current = updated
+        if current < desired:
+            skipped.append(f"{description}: portal has {current} row(s), needs {desired}; add missing row(s) manually")
+
+    def _controls_matching(self, scope, pattern):
+        matches = []
+        try:
+            for control in scope.locator("input,select,textarea").all():
+                if not control.is_visible():
+                    continue
+                metadata = control.evaluate("el => [...(el.labels || [])].map(label => label.innerText).join(' ')")
+                metadata = " ".join(filter(None, [metadata, control.get_attribute("id"), control.get_attribute("name"), control.get_attribute("placeholder"), control.get_attribute("aria-label"), control.get_attribute("title")]))
+                if re.search(pattern, metadata, re.I):
+                    matches.append(control)
+        except Exception:
+            pass
+        return matches
+
+    def _fill_control(self, control, value):
+        if control.evaluate("el => el.tagName.toLowerCase()") == "select":
+            return self._select_best(control, value)
+        control.fill(value)
+        return True
+
+    def _fill_items_and_previous_information(self, groups, machines, skipped, filled):
+        page = self.page
+        item_scope = self._section_locator(r"Items\s+to\s+be\s+verified")
+        categories = page.locator("select[id*='stampinglabourmeasures'][id$='stamping-type-id']")
+        self._ensure_repeater_count(lambda: categories.count(), len(groups), item_scope, "Item categories", skipped)
+        category_controls = categories.all()
+        for index, group in enumerate(groups):
+            if index >= len(category_controls):
+                break
+            try:
+                if self._fill_control(category_controls[index], group["description"]):
+                    filled.append(f"Item category {index + 1}")
+                else:
+                    skipped.append(f"Item category {index + 1}: {group['description']}")
+                element_id = category_controls[index].get_attribute("id") or ""
+                row_match = re.search(r"stampinglabourmeasures-(\d+)-", element_id)
+                row_index = int(row_match.group(1)) if row_match else index
+                quantity = page.locator(f"#stampinglabourmeasures-{row_index}-quantity")
+                if quantity.count():
+                    quantity.fill(str(group["quantity"]))
+                    filled.append(f"Item quantity {index + 1}")
+                else:
+                    skipped.append(f"Item quantity {index + 1}")
+            except Exception:
+                skipped.append(f"Item category/quantity {index + 1}")
+
+        previous_scope = self._section_locator(r"Previous\s+Information")
+        app_pattern = r"application\s*(?:number|no\b)"
+        cv_pattern = r"(?:certificate|previous\s*cv|cv)\s*(?:number|no\b)"
+        model_pattern = r"\bmodel\s*(?:name)?\b"
+        def previous_fields():
+            return (self._controls_matching(previous_scope, app_pattern),
+                    self._controls_matching(previous_scope, cv_pattern),
+                    self._controls_matching(previous_scope, model_pattern))
+        apps, cvs, models = previous_fields()
+        while min(len(apps), len(cvs), len(models)) < len(machines):
+            add = self._add_button(previous_scope)
+            if add is None:
+                break
+            try:
+                add.click(); page.wait_for_timeout(450)
+            except Exception:
+                break
+            new_apps, new_cvs, new_models = previous_fields()
+            if min(len(new_apps), len(new_cvs), len(new_models)) <= min(len(apps), len(cvs), len(models)):
+                break
+            apps, cvs, models = new_apps, new_cvs, new_models
+        if not self._fill_online_choice(previous_scope):
+            skipped.append("Previous Information: Online option")
+        for index, machine in enumerate(machines):
+            app_no = machine.get("Application number", "")
+            cv_no = machine.get("Previous CV number", "")
+            model = machine.get("Instrument description", "")
+            for label, controls, value in (("Application number", apps, app_no), ("Certificate number", cvs, cv_no), ("Model name", models, model)):
+                if index >= len(controls):
+                    skipped.append(f"Previous Information {label} for machine {index + 1}")
+                    continue
+                try:
+                    if value and self._fill_control(controls[index], value):
+                        filled.append(f"Previous Information {label} {index + 1}")
+                    else:
+                        skipped.append(f"Previous Information {label} for machine {index + 1}")
+                except Exception:
+                    skipped.append(f"Previous Information {label} for machine {index + 1}")
+
+    def _fill_online_choice(self, scope):
+        try:
+            for select in scope.locator("select").all():
+                for option in select.locator("option").all():
+                    if self._norm(option.inner_text()) == "online":
+                        select.select_option(value=option.get_attribute("value"))
+                        return True
+        except Exception:
+            pass
+        return False
+
+    def _fill_machine_detail_tables(self, groups, machines, skipped, filled):
+        page = self.page
+        tables = []
+        try:
+            for table in page.locator("table").all():
+                rows = table.locator("tr").all()
+                header_row = None
+                headers = []
+                for row in rows[:3]:
+                    cells = row.locator("th,td").all_inner_texts()
+                    joined = self._norm(" ".join(cells))
+                    if sum(bool(re.search(pattern, joined, re.I)) for pattern in (r"denomination|weight", r"class", r"max", r"min", r"e\s*d|division", r"make|manufacturer", r"model", r"machine|serial")) >= 3:
+                        header_row, headers = row, cells
+                        break
+                if header_row is None:
+                    continue
+                data_rows = [row for row in rows if row.locator("input,select,textarea").count()]
+                data_rows = [row for row in data_rows if row != header_row]
+                if not data_rows:
+                    continue
+                tables.append((table, headers, data_rows))
+        except Exception:
+            tables = []
+        if not tables:
+            skipped.append("Machine details: could not identify the portal table columns; review and enter machine rows manually")
+            return
+
+        grouped_rows = [group.get("machines", []) for group in groups]
+        flat_rows = [row for group in grouped_rows for row in group]
+        def data_rows_for(table):
+            rows = table.locator("tr").all()
+            return [row for row in rows if row.locator("input,select,textarea").count()]
+
+        expanded = []
+        for table_index, (table, headers, _old_rows) in enumerate(tables):
+            expected = len(flat_rows) if len(tables) == 1 else len(grouped_rows[table_index]) if table_index < len(grouped_rows) else 0
+            if expected:
+                if len(tables) == 1:
+                    scope = self._section_locator(r"Items\s+to\s+be\s+verified")
+                else:
+                    group_text = groups[table_index].get("description", "") if table_index < len(groups) else "Items to be verified"
+                    scope = self._section_locator(re.escape(group_text)) if group_text else self._section_locator(r"Items\s+to\s+be\s+verified")
+                current_rows = data_rows_for(table)
+                while len(current_rows) < expected:
+                    add = self._add_button(scope)
+                    if add is None:
+                        break
+                    try:
+                        add.click(); page.wait_for_timeout(450)
+                    except Exception:
+                        break
+                    updated = data_rows_for(table)
+                    if len(updated) <= len(current_rows):
+                        break
+                    current_rows = updated
+            else:
+                current_rows = data_rows_for(table)
+            if len(current_rows) < expected:
+                skipped.append(f"Machine details: portal table has {len(current_rows)} row(s), needs {expected}")
+            expanded.append((table, headers, current_rows))
+        tables = expanded
+        pattern_map = {
+            "Denomination": r"denomination|weight\b",
+            "Class": r"\bclass\b",
+            "Maximum capacity": r"\bmax(?:imum)?\b",
+            "Minimum capacity": r"\bmin(?:imum)?\b",
+            "Verification interval (e/d)": r"e\s*/?\s*d|division|interval",
+            "Instrument make": r"make|manufacturer|brand",
+            "Instrument model": r"\bmodel\b",
+            "Machine number": r"machine\s*(?:no|number)|serial",
+            "Previous CV number": r"previous\s*cv|certificate\s*(?:no|number)|cv\s*(?:no|number)",
+        }
+
+        def fill_row(row_locator, headers, machine, machine_index):
+            cells = row_locator.locator("th,td").all()
+            found = set()
+            for col, cell in enumerate(cells):
+                header = headers[col] if col < len(headers) else ""
+                field = next((name for name, pattern in pattern_map.items() if re.search(pattern, header, re.I)), None)
+                if not field:
+                    continue
+                value = machine.get(field, "")
+                if field == "Previous CV number":
+                    value = machine.get("Previous CV number", "")
+                controls = cell.locator("input,select,textarea")
+                if not value or not controls.count():
+                    continue
+                try:
+                    if self._fill_control(controls.first, value):
+                        found.add(field)
+                        filled.append(f"Machine {machine_index + 1} {field}")
+                except Exception:
+                    pass
+            return found
+
+        cursor = 0
+        if len(tables) == 1:
+            table, headers, data_rows = tables[0]
+            for row_idx, row_locator in enumerate(data_rows[:len(flat_rows)]):
+                found = fill_row(row_locator, headers, flat_rows[row_idx], row_idx)
+                for key in pattern_map:
+                    if flat_rows[row_idx].get(key) and key not in found:
+                        skipped.append(f"Machine {row_idx + 1} {key}")
+            if len(data_rows) < len(flat_rows):
+                skipped.append(f"Machine detail table has {len(data_rows)} row(s); needs {len(flat_rows)}")
+            return
+
+        for table, headers, data_rows in tables:
+            group_rows = grouped_rows[cursor] if cursor < len(grouped_rows) else []
+            for row_idx, row_locator in enumerate(data_rows[:len(group_rows)]):
+                machine = group_rows[row_idx]
+                global_index = flat_rows.index(machine)
+                found = fill_row(row_locator, headers, machine, global_index)
+                for key in pattern_map:
+                    if machine.get(key) and key not in found:
+                        skipped.append(f"Machine {global_index + 1} {key}")
+            cursor += 1
+
+    def _fill_machine_rows(self, rows, skipped):
+        """Fill indexed machine rows when the portal exposes matching controls."""
+        if not rows:
+            return
+        page = self.page
+
+        def available_indices():
+            indices = set()
+            try:
+                ids = page.locator("input[id],select[id],textarea[id]").evaluate_all("els => els.map(el => el.id)")
+                for element_id in ids:
+                    match = re.search(r"stampinglabourmeasures-(\d+)-", element_id or "", re.I)
+                    if match:
+                        indices.add(int(match.group(1)))
+            except Exception:
+                pass
+            return indices
+
+        indices = available_indices()
+        while len(indices) < len(rows):
+            add_control = None
+            try:
+                for control in page.locator("button,a,[role='button']").all():
+                    if not control.is_visible():
+                        continue
+                    label = " ".join(filter(None, [control.inner_text(timeout=500), control.get_attribute("aria-label"), control.get_attribute("title")]))
+                    if re.search(r"\badd\b.*\b(machine|instrument|item|measure|row)\b|\badd another\b", label, re.I):
+                        add_control = control
+                        break
+            except Exception:
+                add_control = None
+            if add_control is None:
+                break
+            try:
+                add_control.click()
+                page.wait_for_timeout(450)
+            except Exception:
+                break
+            updated = available_indices()
+            if len(updated) <= len(indices):
+                break
+            indices = updated
+
+        if len(indices) < len(rows):
+            skipped.append(f"Portal machine rows: found {len(indices)} for {len(rows)} PDF machine(s); add the remaining row(s) manually")
+
+        field_patterns = {
+            "Denomination": r"\b(weight|denomination)\b",
+            "Instrument make": r"\b(make|manufacturer|brand)\b",
+            "Maximum capacity": r"\b(max(?:imum)?|capacity max)\b",
+            "Minimum capacity": r"\b(min(?:imum)?|capacity min)\b",
+            "Verification interval (e/d)": r"\b(e\s*/?\s*d|division|interval)\b",
+            "Instrument model": r"\bmodel\b",
+            "Machine number": r"\b(machine\s*(?:no|number)|serial\s*(?:no|number))\b",
+            "Class": r"\b(class|accuracy)\b",
+        }
+        ordered_indices = sorted(indices)
+        for position, row in enumerate(rows[:len(ordered_indices)]):
+            index = ordered_indices[position]
+            category = page.locator(f"#stampinglabourmeasures-{index}-stamping-type-id")
+            if row.get("Instrument description") and not self._select_best(category, row["Instrument description"]):
+                skipped.append(f"Machine {position + 1}: item category")
+            quantity = page.locator(f"#stampinglabourmeasures-{index}-quantity")
+            if row.get("Quantity"):
+                try:
+                    if quantity.count():
+                        quantity.fill(row["Quantity"])
+                    else:
+                        skipped.append(f"Machine {position + 1}: quantity")
+                except Exception:
+                    skipped.append(f"Machine {position + 1}: quantity")
+            try:
+                controls = page.locator(f"input[id*='stampinglabourmeasures-{index}-'],select[id*='stampinglabourmeasures-{index}-'],textarea[id*='stampinglabourmeasures-{index}-']").all()
+            except Exception:
+                controls = []
+            for control in controls:
+                try:
+                    element_id = control.get_attribute("id") or ""
+                    if element_id.endswith(("-quantity", "-stamping-type-id")):
+                        continue
+                    label = control.evaluate("el => [...(el.labels || [])].map(x => x.innerText).join(' ')")
+                    metadata = self._norm(" ".join(filter(None, [element_id, control.get_attribute("name"), control.get_attribute("placeholder"), control.get_attribute("aria-label"), label])))
+                    field = next((key for key, pattern in field_patterns.items() if re.search(pattern, metadata, re.I)), None)
+                    value = row.get(field, "") if field else ""
+                    if not value:
+                        continue
+                    if control.evaluate("el => el.tagName.toLowerCase()") == "select":
+                        self._select_best(control, value)
+                    else:
+                        control.fill(value)
+                except Exception:
+                    continue
 
     @staticmethod
     def _number(value: str) -> float | None:
@@ -670,7 +1344,8 @@ class PortalWorker(threading.Thread):
         if re.search(r"payment|receipt|checkout", page.url, re.I) or page.get_by_text(payment_text).count():
             self.messages.put(("payment", "The portal is already at a payment step. The assistant will not interact with payment."))
             return
-        self._navigate_to_stamping_form()
+        if not self.ready_for_submit:
+            self._navigate_to_stamping_form()
         submit = page.get_by_role("button", name=re.compile(r"submit", re.I)).last
         if not submit.count():
             submit = page.locator('input[type="submit"]').last
@@ -687,6 +1362,7 @@ class PortalWorker(threading.Thread):
             self.messages.put(("payment", "The application was submitted and the payment page is ready. Review the amount and complete payment yourself."))
         else:
             self.messages.put(("submitted", "The application was submitted. The portal did not clearly identify the next page as payment; review the app browser. No payment was made."))
+        self.ready_for_submit = False
 
 
 class App(tk.Tk):
@@ -695,7 +1371,8 @@ class App(tk.Tk):
         self.title(APP_NAME)
         self.geometry("1030x820")
         self.minsize(900, 690)
-        self.configure(bg="#f3f6fa")
+        self.theme_is_dark = None
+        self._theme_widgets_applied = False
         self.msgq: queue.Queue = queue.Queue()
         self.worker: PortalWorker | None = None
         self.profile = {}
@@ -705,23 +1382,77 @@ class App(tk.Tk):
             messagebox.showerror("Profile could not be opened", f"Encrypted profile could not be read. It may belong to another Windows user.\n\n{e}")
         self.files = {"certificate": "", "authorization": ""}
         self.vars = {}
+        self.machine_rows = []
+        self.machine_metadata = []
         self._styles()
         self._build()
+        self._theme_widgets_applied = False
         self._load_profile()
         self.after(250, self._poll)
+        self._refresh_system_theme()
 
     def _styles(self):
         style = ttk.Style(self)
         style.theme_use("clam")
-        style.configure("TFrame", background="#f3f6fa")
-        style.configure("Card.TFrame", background="#ffffff")
-        style.configure("TLabel", background="#f3f6fa", foreground="#243247", font=("Segoe UI", 10))
-        style.configure("Title.TLabel", background="#f3f6fa", foreground="#172b4d", font=("Segoe UI Semibold", 20))
-        style.configure("Sub.TLabel", background="#f3f6fa", foreground="#62738a", font=("Segoe UI", 10))
-        style.configure("Section.TLabel", background="#ffffff", foreground="#172b4d", font=("Segoe UI Semibold", 12))
+        self._apply_theme(self._system_dark_mode())
         style.configure("TButton", font=("Segoe UI Semibold", 10), padding=(12, 8))
-        style.configure("Primary.TButton", background="#1261a0", foreground="white")
-        style.map("Primary.TButton", background=[("active", "#0c4b7d")])
+
+    def _system_dark_mode(self):
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as key:
+                return winreg.QueryValueEx(key, "AppsUseLightTheme")[0] == 0
+        except OSError:
+            return False
+
+    def _apply_theme(self, dark):
+        if self.theme_is_dark == dark and self._theme_widgets_applied:
+            return
+        previous = getattr(self, "palette", {"bg": "#f3f6fa", "card": "#ffffff", "muted": "#62738a"})
+        self.theme_is_dark = dark
+        if dark:
+            self.palette = {"bg": "#171a21", "card": "#222630", "fg": "#e6e9ef", "muted": "#aab3c2", "title": "#f3f5f8", "input": "#171a21", "border": "#485162", "accent": "#2478bd", "accent_active": "#1b6098", "selection": "#315b7d"}
+        else:
+            self.palette = {"bg": "#f3f6fa", "card": "#ffffff", "fg": "#243247", "muted": "#62738a", "title": "#172b4d", "input": "#ffffff", "border": "#c5ccd6", "accent": "#1261a0", "accent_active": "#0c4b7d", "selection": "#b7d7f0"}
+        p = self.palette
+        self.configure(bg=p["bg"])
+        if hasattr(self, "scroll_canvas"):
+            self.scroll_canvas.configure(bg=p["bg"])
+        style = ttk.Style(self)
+        style.configure("TFrame", background=p["bg"])
+        style.configure("Card.TFrame", background=p["card"])
+        style.configure("TLabel", background=p["bg"], foreground=p["fg"], font=("Segoe UI", 10))
+        style.configure("Title.TLabel", background=p["bg"], foreground=p["title"], font=("Segoe UI Semibold", 20))
+        style.configure("Sub.TLabel", background=p["bg"], foreground=p["muted"], font=("Segoe UI", 10))
+        style.configure("Section.TLabel", background=p["card"], foreground=p["title"], font=("Segoe UI Semibold", 12))
+        style.configure("Card.TLabel", background=p["card"], foreground=p["fg"])
+        style.configure("Muted.Card.TLabel", background=p["card"], foreground=p["muted"])
+        style.configure("TEntry", fieldbackground=p["input"], foreground=p["fg"], bordercolor=p["border"])
+        style.configure("TCombobox", fieldbackground=p["input"], background=p["card"], foreground=p["fg"], arrowcolor=p["fg"])
+        style.map("TCombobox", fieldbackground=[("readonly", p["input"])], foreground=[("readonly", p["fg"])], selectbackground=[("readonly", p["selection"])], selectforeground=[("readonly", p["fg"])])
+        style.configure("Primary.TButton", background=p["accent"], foreground="white")
+        style.map("Primary.TButton", background=[("active", p["accent_active"])])
+        for widget in self.winfo_children():
+            self._retheme_widgets(widget, previous)
+
+    def _retheme_widgets(self, widget, previous):
+        p = self.palette
+        try:
+            if isinstance(widget, tk.Canvas):
+                widget.configure(bg=p["bg"])
+            elif isinstance(widget, tk.Toplevel):
+                widget.configure(bg=p["bg"])
+            elif isinstance(widget, tk.Label):
+                current_bg = str(widget.cget("bg"))
+                widget.configure(bg=p["card"] if current_bg.lower() in ("white", "#ffffff") else p["bg"], fg=p["muted"] if str(widget.cget("fg")).lower() in ("#62738a", "#6c7b8d") else p["fg"])
+        except tk.TclError:
+            pass
+        for child in widget.winfo_children():
+            self._retheme_widgets(child, previous)
+        self._theme_widgets_applied = True
+
+    def _refresh_system_theme(self):
+        self._apply_theme(self._system_dark_mode())
+        self.after(1600, self._refresh_system_theme)
 
     def _mousewheel(self, event):
         widget = self.winfo_containing(event.x_root, event.y_root)
@@ -745,8 +1476,8 @@ class App(tk.Tk):
         outer = ttk.Frame(self, padding=22)
         outer.pack(fill="both", expand=True)
         ttk.Label(outer, text="TN Stamping Assistant", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(outer, text="Read a previous certificate, prepare the stamping form, and stop at payment.", style="Sub.TLabel").pack(anchor="w", pady=(2, 16))
-        canvas = tk.Canvas(outer, bg="#f3f6fa", highlightthickness=0)
+        ttk.Label(outer, text="Read a previous certificate, prepare the stamping form, and review before submission.", style="Sub.TLabel").pack(anchor="w", pady=(2, 16))
+        canvas = tk.Canvas(outer, bg=self.palette["bg"], highlightthickness=0)
         scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
         body = ttk.Frame(canvas)
         body.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
@@ -770,28 +1501,28 @@ class App(tk.Tk):
         ttk.Button(row, text="Add account", command=self.add_account, style="Primary.TButton").pack(side="left", padx=(10, 0))
         ttk.Button(row, text="Edit credentials", command=self.edit_account).pack(side="left", padx=(8, 0))
 
+        docs = self._card(body, "Documents")
+        self._file_row(docs, "Purchase invoice / Previous CV (PDF)", "certificate", ("PDF files", "*.pdf"))
+        self._file_row(docs, "Authorisation letter from user / owner", "authorization", ("PDF or image", "*.pdf *.jpg *.jpeg *.png"))
+        ttk.Label(docs, text="PAN card image is uploaded from the selected account. Portal file uploads must be under 1 MB.", style="Muted.Card.TLabel").pack(anchor="w", pady=(8, 0))
+
         first_page = self._card(body, "Application review — applicant and first page")
         ttk.Button(first_page, text="Read PDF and fill draft", command=self.read_pdf, style="Primary.TButton").pack(anchor="w", pady=(8, 6))
         self.first_page_field_frame = ttk.Frame(first_page, style="Card.TFrame")
         self.first_page_field_frame.pack(fill="x")
 
-        docs = ttk.Frame(first_page, style="Card.TFrame"); docs.pack(fill="x", pady=(14, 0))
-        ttk.Label(docs, text="Documents for the first page", style="Section.TLabel").pack(anchor="w", pady=(0, 6))
-        self._file_row(docs, "Purchase invoice / Previous CV (PDF)", "certificate", ("PDF files", "*.pdf"))
-        self._file_row(docs, "Authorisation letter from user / owner", "authorization", ("PDF or image", "*.pdf *.jpg *.jpeg *.png"))
-
         machine = self._card(body, "Machine details — certificate table")
-        ttk.Label(machine, text="Review or correct the machine row read from the certificate table.", background="white", foreground="#62738a").pack(anchor="w", pady=(4, 8))
+        ttk.Label(machine, text="Review or correct each machine row read from the certificate pages.", style="Muted.Card.TLabel").pack(anchor="w", pady=(4, 8))
         self.machine_field_frame = ttk.Frame(machine, style="Card.TFrame")
         self.machine_field_frame.pack(fill="x")
         self.pan_name = tk.StringVar(); self.pan_number = tk.StringVar(); self.pan_date = tk.StringVar(); self.license_number = tk.StringVar()
-        ttk.Label(first_page, text="PAN card image is uploaded from the selected account. Portal file uploads must be under 1 MB.", background="white", foreground="#6c7b8d").pack(anchor="w", pady=(8, 0))
+        self.repairer_establishment_var = tk.StringVar()
         self._set_fields({})
 
         action = ttk.Frame(body, style="Card.TFrame", padding=14); action.pack(fill="x", pady=(12, 5))
         ttk.Button(action, text="Start application", command=self.open_portal, style="Primary.TButton").pack(side="left", padx=(0, 8))
         ttk.Button(action, text="Fill now / retry", command=self.fill_application).pack(side="left", padx=8)
-        ttk.Button(action, text="Submit to payment page (retry)", command=self.submit_application).pack(side="left", padx=8)
+        ttk.Button(action, text="Submit application", command=self.submit_application).pack(side="left", padx=8)
         self.status = tk.StringVar(value="Ready. Choose documents, review the PDF draft, then open the portal.")
         ttk.Label(body, textvariable=self.status, style="Sub.TLabel", wraplength=930).pack(anchor="w", pady=(10, 0))
 
@@ -803,10 +1534,10 @@ class App(tk.Tk):
 
     def _file_row(self, parent, label, key, file_filter):
         frame = ttk.Frame(parent, style="Card.TFrame"); frame.pack(fill="x", pady=(8, 0))
-        ttk.Label(frame, text=label, width=40, background="white").pack(side="left")
+        ttk.Label(frame, text=label, width=40, style="Card.TLabel").pack(side="left")
         display = tk.StringVar(value="No file selected")
         self.files[key + "_display"] = display
-        ttk.Label(frame, textvariable=display, background="white", foreground="#62738a").pack(side="left", fill="x", expand=True, padx=8)
+        ttk.Label(frame, textvariable=display, style="Muted.Card.TLabel").pack(side="left", fill="x", expand=True, padx=8)
         ttk.Button(frame, text="Choose file", command=lambda: self.choose_file(key, file_filter)).pack(side="right")
 
     def choose_file(self, key, file_filter):
@@ -815,27 +1546,45 @@ class App(tk.Tk):
             self.files[key] = path
             self.files[key + "_display"].set(Path(path).name)
 
-    def _set_fields(self, values):
+    def _set_fields(self, values, machine_data=None):
         for frame in (self.first_page_field_frame, self.machine_field_frame):
             for widget in frame.winfo_children(): widget.destroy()
         self.vars.clear()
+        self.machine_rows = []
+        self.machine_metadata = []
         first_idx = 0
         machine_keys = [
-            "Instrument description", "Instrument make", "Maximum capacity", "Minimum capacity",
+            "Denomination", "Instrument description", "Instrument make", "Maximum capacity", "Minimum capacity",
             "Verification interval (e/d)", "Instrument model", "Machine number", "Class", "Quantity",
         ]
         machine_headers = {
-            "Instrument description": "Weight / type", "Instrument make": "Make",
+            "Denomination": "Weight", "Instrument description": "Instrument type", "Instrument make": "Make",
             "Maximum capacity": "Max", "Minimum capacity": "Min",
             "Verification interval (e/d)": "e/d", "Instrument model": "Model",
             "Machine number": "Machine number", "Class": "Class", "Quantity": "Qty",
         }
         for col, name in enumerate(machine_keys):
-            ttk.Label(self.machine_field_frame, text=machine_headers.get(name, name), background="white", wraplength=105, anchor="center").grid(row=0, column=col, sticky="nsew", padx=2, pady=(0, 4))
-            var = tk.StringVar(value=values.get(name, ""))
-            self.vars[name] = var
-            ttk.Entry(self.machine_field_frame, textvariable=var, width=13).grid(row=1, column=col, sticky="ew", padx=2, pady=2)
+            ttk.Label(self.machine_field_frame, text=machine_headers.get(name, name), style="Card.TLabel", wraplength=105, anchor="center").grid(row=0, column=col, sticky="nsew", padx=2, pady=(0, 4))
             self.machine_field_frame.columnconfigure(col, weight=1, uniform="machine")
+        records = machine_data or [{name: values.get(name, "") for name in machine_keys}]
+        for machine_index, record in enumerate(records):
+            label_row = 1 + machine_index * 2
+            field_row = label_row + 1
+            machine_type = record.get("Instrument description", "")
+            certificate_no = record.get("Previous CV number", "")
+            title = f"Machine {machine_index + 1}" + (f" — {machine_type}" if machine_type else "")
+            if certificate_no:
+                title += f" (CV {certificate_no})"
+            ttk.Label(self.machine_field_frame, text=title, style="Muted.Card.TLabel", wraplength=920, justify="left").grid(row=label_row, column=0, columnspan=len(machine_keys), sticky="w", padx=2, pady=(6, 0))
+            row_vars = {}
+            for col, name in enumerate(machine_keys):
+                var = tk.StringVar(value=record.get(name, ""))
+                row_vars[name] = var
+                ttk.Entry(self.machine_field_frame, textvariable=var, width=11).grid(row=field_row, column=col, sticky="ew", padx=2, pady=2)
+                if machine_index == 0:
+                    self.vars[name] = var
+            self.machine_rows.append(row_vars)
+            self.machine_metadata.append({key: value for key, value in record.items() if key not in machine_keys})
         for name in FIELD_LABELS:
             if name in MACHINE_REVIEW_FIELDS:
                 continue
@@ -843,7 +1592,7 @@ class App(tk.Tk):
             idx = first_idx
             var = tk.StringVar(value=values.get(name, ""))
             self.vars[name] = var
-            ttk.Label(frame, text=name, background="white").grid(row=idx, column=0, sticky="w", pady=3, padx=(0, 10))
+            ttk.Label(frame, text=name, style="Card.TLabel").grid(row=idx, column=0, sticky="w", pady=3, padx=(0, 10))
             ttk.Entry(frame, textvariable=var, width=75).grid(row=idx, column=1, sticky="ew", pady=3)
             first_idx += 1
         self.first_page_field_frame.columnconfigure(1, weight=1)
@@ -858,14 +1607,15 @@ class App(tk.Tk):
             messagebox.showinfo("Choose the previous certificate", "Select the previous CV or purchase invoice PDF first.")
             return
         try:
-            text = pdf_text(path)
-            if not text.strip():
+            page_count, meaningful_page_count, values, machines = extract_certificate_document(path)
+            if not machines:
                 messagebox.showwarning("No selectable text found", "This PDF appears to be a scan. Use a text-searchable PDF; OCR is not included in this local build.")
                 return
-            values = extract_certificate(text)
-            values.update({"Applicant business name": self.business_var.get(), "Applicant contact name": self.contact_var.get(), "Registered name": self.contact_var.get(), "Registered email": self.user_var.get(), "Registered mobile": self.mobile_var.get(), "Used by / trader contact": self.trader_contact_var.get(), "PAN name": self.pan_name.get(), "PAN number": self.pan_number.get(), "PAN date": self.pan_date.get(), "Repairer licence number": self.license_number.get()})
-            self._set_fields(values)
-            self.status.set(f"Draft prepared from {Path(path).name}. Review and correct every value before filling the portal.")
+            values.update({"Applicant business name": values.get("Applicant / establishment name", ""), "Applicant contact name": self.contact_var.get(), "Registered name": self.contact_var.get(), "Registered email": self.user_var.get(), "Registered mobile": self.mobile_var.get(), "Used by / trader contact": self.business_var.get() or values.get("Repairer business name", ""), "PAN name": self.pan_name.get(), "PAN number": self.pan_number.get(), "PAN date": self.pan_date.get(), "Repairer name": self.pan_name.get(), "Repairer licence number": self.license_number.get()})
+            self.repairer_establishment_var.set(self.business_var.get() or values.get("Repairer business name", ""))
+            self._set_fields(values, machines)
+            ignored = page_count - meaningful_page_count
+            self.status.set(f"Draft read from {Path(path).name}: {page_count} pages, {len(machines)} machine(s), {ignored} blank/footer page(s) ignored. Review every value before filling the portal.")
         except Exception as e:
             messagebox.showerror("Could not read PDF", str(e))
 
@@ -949,7 +1699,7 @@ class App(tk.Tk):
         window.geometry("540x690")
         pad = ttk.Frame(window, padding=18); pad.pack(fill="both", expand=True)
         ttk.Label(pad, text="Portal sign-in and matching PAN profile", style="Section.TLabel").pack(anchor="w")
-        ttk.Label(pad, text="All details and the PAN image are encrypted together for this email account.", background="#f3f6fa", foreground="#62738a", wraplength=480).pack(anchor="w", pady=(4, 12))
+        ttk.Label(pad, text="All details and the PAN image are encrypted together for this email account.", style="Sub.TLabel", wraplength=480).pack(anchor="w", pady=(4, 12))
 
         email_var = tk.StringVar(); password_var = tk.StringVar()
         pan_name_var = tk.StringVar(); pan_number_var = tk.StringVar(); pan_date_var = tk.StringVar()
@@ -986,9 +1736,9 @@ class App(tk.Tk):
             except OSError as exc:
                 messagebox.showerror("Could not read PAN image", str(exc), parent=window)
 
-        ttk.Label(pad, text="PAN card image", background="#f3f6fa").pack(anchor="w", pady=(8, 2))
+        ttk.Label(pad, text="PAN card image").pack(anchor="w", pady=(8, 2))
         image_row = ttk.Frame(pad); image_row.pack(fill="x")
-        ttk.Label(image_row, textvariable=image_label, foreground="#62738a").pack(side="left", fill="x", expand=True)
+        ttk.Label(image_row, textvariable=image_label, style="Sub.TLabel").pack(side="left", fill="x", expand=True)
         ttk.Button(image_row, text="Choose JPG / PNG", command=choose_pan_image).pack(side="right")
 
         def load_existing(_event=None):
@@ -1081,25 +1831,35 @@ class App(tk.Tk):
         if not self.user_var.get() or not self.pass_var.get():
             messagebox.showwarning("Sign-in needed", "Choose an email from the dropdown or add an account.")
             return
-        if not self.files.get("certificate"):
-            messagebox.showwarning("Previous CV required", "Choose the previous CV PDF and read/review the draft before starting the application.")
-            return
         self._ensure_worker()
-        self.worker.send("open", {"credentials": {"username": self.user_var.get(), "password": self.pass_var.get()}, "application": self._application_payload()})
-        self.status.set("Opening the app browser and filling saved sign-in. Enter the CAPTCHA there; login and application steps continue automatically.")
+        has_draft = bool(self.machine_rows and self.files.get("certificate"))
+        try:
+            self.worker.send("open", {"credentials": {"username": self.user_var.get(), "password": self.pass_var.get()}, "application": self._application_payload() if has_draft else None})
+            self.status.set("Opening bundled Chromium and filling saved sign-in. Enter the CAPTCHA in that window; a reviewed PDF draft will continue automatically after login." if has_draft else "Opening bundled Chromium and filling saved sign-in. Enter the CAPTCHA there. Read the PDF draft, then choose Fill now / retry after login.")
+        except Exception as exc:
+            self.status.set(f"Could not start Chromium: {exc}")
+            messagebox.showerror("Could not start Chromium", str(exc))
 
     def _ensure_worker(self):
         if not self.worker or not self.worker.is_alive(): self.worker = PortalWorker(self.msgq)
 
     def fill_application(self):
-        if not self.worker or not self.worker.is_alive():
-            messagebox.showinfo("Sign in first", "Open the app browser, complete CAPTCHA, and log in first.")
+        self._on_account_selected()
+        if not self.user_var.get() or not self.pass_var.get():
+            messagebox.showwarning("Sign-in needed", "Choose an email from the dropdown or add an account.")
             return
-        if not self.files.get("certificate"):
-            messagebox.showwarning("Previous CV required", "Choose the PDF to upload as the previous CV.")
+        if not self.files.get("certificate") or not self.machine_rows:
+            messagebox.showwarning("PDF draft required", "Choose the previous CV PDF and select Read PDF and fill draft first.")
             return
-        self.worker.send("fill", self._application_payload())
-        self.status.set("Filling matching fields and uploads in the app browser.")
+        self._ensure_worker()
+        payload = self._application_payload()
+        payload["credentials"] = {"username": self.user_var.get(), "password": self.pass_var.get()}
+        try:
+            self.worker.send("fill", payload)
+            self.status.set("Filling the application in bundled Chromium. If you are not signed in, the browser will open for CAPTCHA first.")
+        except Exception as exc:
+            self.status.set(f"Could not start Chromium: {exc}")
+            messagebox.showerror("Could not start Chromium", str(exc))
 
     def _application_payload(self):
         fields = {k: v.get().strip() for k, v in self.vars.items()}
@@ -1107,12 +1867,13 @@ class App(tk.Tk):
         fields["PAN number"] = fields.get("PAN number", "") or self.pan_number.get().strip()
         fields["PAN date"] = fields.get("PAN date", "") or self.pan_date.get().strip()
         fields["Repairer licence number"] = self.license_number.get().strip() or fields.get("Repairer licence number", "")
-        fields["Applicant business name"] = fields.get("Applicant business name", "") or self.business_var.get().strip()
+        fields["Repairer name"] = self.pan_name.get().strip() or fields.get("Repairer name", "")
+        fields["Applicant business name"] = fields.get("Applicant business name", "") or fields.get("Applicant / establishment name", "")
         fields["Applicant contact name"] = fields.get("Applicant contact name", "") or self.contact_var.get().strip()
         fields["Registered name"] = fields.get("Registered name", "") or self.contact_var.get().strip()
         fields["Registered email"] = self.user_var.get().strip() or fields.get("Registered email", "")
         fields["Registered mobile"] = fields.get("Registered mobile", "") or self.mobile_var.get().strip()
-        fields["Used by / trader contact"] = fields.get("Used by / trader contact", "") or self.trader_contact_var.get().strip()
+        fields["Used by / trader contact"] = self.repairer_establishment_var.get().strip() or fields.get("Used by / trader contact", "") or self.business_var.get().strip()
         image_payload = None
         account_index = self.account_combo.current()
         account = self.accounts[account_index] if 0 <= account_index < len(self.accounts) else {}
@@ -1121,16 +1882,37 @@ class App(tk.Tk):
             image_bytes = base64.b64decode(encoded)
             image_name = account.get("pan_image_name", "pan-card.jpg")
             image_payload = {"name": image_name, "mimeType": mimetypes.guess_type(image_name)[0] or "image/jpeg", "buffer": image_bytes}
-        return {"fields": fields, "certificate": self.files.get("certificate"), "authorization": self.files.get("authorization"), "pan_image_data": image_payload}
+        machine_rows = []
+        for index, row in enumerate(self.machine_rows):
+            item = {key: value.get().strip() for key, value in row.items()}
+            if index < len(self.machine_metadata):
+                item.update(self.machine_metadata[index])
+            machine_rows.append(item)
+        grouped = {}
+        for row in machine_rows:
+            description = row.get("Instrument description", "")
+            key = normalize_text(description)
+            if not key:
+                continue
+            group = grouped.setdefault(key, {"description": description, "quantity": 0, "machines": []})
+            try:
+                group["quantity"] += int(row.get("Quantity") or 0)
+            except ValueError:
+                pass
+            group["machines"].append(row)
+        return {"fields": fields, "machine_rows": machine_rows, "item_groups": list(grouped.values()), "certificate": self.files.get("certificate"), "authorization": self.files.get("authorization"), "pan_image_data": image_payload}
 
     def submit_application(self):
         if not self.worker or not self.worker.is_alive():
             messagebox.showinfo("Sign in first", "Log in through the app browser and prepare the application first.")
             return
-        if not messagebox.askyesno("Submit application", "Submit the information and files currently shown in the portal to Tamil Nadu Labour Department?\n\nReview the form in Chrome before continuing. This will stop at the payment page; no payment will be made."):
+        if not self.worker.ready_for_submit:
+            messagebox.showinfo("Finish the review pages first", "Use Start application or Fill now / retry and complete the portal pages through the final review page before submitting.")
+            return
+        if not messagebox.askyesno("Submit application", "Submit this completed application to the Tamil Nadu Labour Department?\n\nReview the portal pages first. This is the final application submission; the app will not make a payment."):
             return
         self.worker.send("submit")
-        self.status.set("Submitting the reviewed application; payment is not part of this action.")
+        self.status.set("Submitting the reviewed application. No payment will be made.")
 
     def _poll(self):
         try:
@@ -1146,6 +1928,12 @@ class App(tk.Tk):
                     self.status.set(value); messagebox.showinfo("Payment page reached", value)
                 elif kind == "submitted":
                     self.status.set(value); messagebox.showinfo("Application submitted", value)
+                elif kind == "login_ok":
+                    self.status.set(value); messagebox.showinfo("Sign-in confirmed", value)
+                elif kind == "login_failed":
+                    self.status.set(value); messagebox.showwarning("Sign-in not confirmed", value)
+                elif kind == "ready_to_submit":
+                    self.status.set(value); messagebox.showinfo("Review before submission", value)
                 else:
                     self.status.set(value)
         except queue.Empty: pass

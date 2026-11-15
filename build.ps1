@@ -23,8 +23,8 @@ Get-ChildItem -LiteralPath $env:PLAYWRIGHT_BROWSERS_PATH -Directory -Filter "chr
     if (-not $resolved.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { throw "Refusing to remove an unexpected browser path: $resolved" }
     Remove-Item -LiteralPath $resolved -Recurse -Force
 }
-python -m PyInstaller --noconfirm --clean --onefile --windowed `
-    --name TN_Stamping_Assistant_v10 `
+python -m PyInstaller --noconfirm --clean --onefile --windowed --noupx `
+    --name TN_Stamping_Assistant_v19 `
     --add-data "$env:PLAYWRIGHT_BROWSERS_PATH;.pw-browsers" `
     --collect-all playwright `
     --collect-all pdfplumber `
@@ -35,4 +35,4 @@ if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller failed with exit code $LASTEXITCODE"
 }
 
-Write-Host "Built: $project\dist\TN_Stamping_Assistant_v10.exe"
+Write-Host "Built: $project\dist\TN_Stamping_Assistant_v19.exe"

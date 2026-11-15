@@ -5,3 +5,4 @@ dist/
 __pycache__/
 *.py[cod]
 Stamping list generator.exe
+TN_Stamping_Assistant_v*.spec
