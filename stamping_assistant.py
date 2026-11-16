@@ -1862,7 +1862,7 @@ class App(tk.Tk):
         try:
             self.profile = load_vault()
         except Exception as e:
-            messagebox.showerror("Profile could not be opened", f"Encrypted profile could not be read. It may belong to another Windows user.\n\n{e}")
+            self._show_copyable_error("Profile could not be opened", f"Encrypted profile could not be read. It may belong to another Windows user.\n\n{e}")
         self.files = {"certificate": "", "authorization": ""}
         self.vars = {}
         self.machine_rows = []
@@ -1879,6 +1879,55 @@ class App(tk.Tk):
         style.theme_use("clam")
         self._apply_theme(self._system_dark_mode())
         style.configure("TButton", font=("Segoe UI Semibold", 10), padding=(12, 8))
+
+    def _show_copyable_error(self, title, message, parent=None):
+        """Show an error in selectable text with a one-click copy action."""
+        p = getattr(self, "palette", {"bg": "#f3f6fa", "card": "#ffffff", "fg": "#243247", "border": "#c5ccd6", "selection": "#b7d7f0"})
+        dialog = tk.Toplevel(parent or self)
+        dialog.title(title)
+        dialog.configure(bg=p["bg"])
+        dialog.transient(parent or self)
+        width, height = 720, 460
+        dialog.update_idletasks()
+        owner = parent or self
+        x = owner.winfo_rootx() + max(0, (owner.winfo_width() - width) // 2)
+        y = owner.winfo_rooty() + max(0, (owner.winfo_height() - height) // 2)
+        x = min(x, max(0, dialog.winfo_screenwidth() - width))
+        y = min(y, max(0, dialog.winfo_screenheight() - height))
+        dialog.geometry(f"{width}x{height}+{x}+{y}")
+        dialog.minsize(540, 300)
+        body = ttk.Frame(dialog, padding=14)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="Select the message or use Copy error to paste it into an update.", wraplength=680).pack(anchor="w", pady=(0, 8))
+        text_frame = ttk.Frame(body)
+        text_frame.pack(fill="both", expand=True)
+        text = tk.Text(text_frame, wrap="word", font=("Consolas", 10), bg=p["card"], fg=p["fg"], insertbackground=p["fg"], selectbackground=p["selection"], relief="solid", borderwidth=1, padx=8, pady=8)
+        scrollbar = ttk.Scrollbar(text_frame, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=scrollbar.set)
+        text.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        text.insert("1.0", str(message))
+        text.configure(state="disabled")
+        text.tag_add("sel", "1.0", "end-1c")
+        text.focus_set()
+        feedback = tk.StringVar(value="")
+        footer = ttk.Frame(body)
+        footer.pack(fill="x", pady=(10, 0))
+        ttk.Label(footer, textvariable=feedback).pack(side="left")
+        def copy_error():
+            try:
+                dialog.clipboard_clear()
+                dialog.clipboard_append(str(message))
+                dialog.update_idletasks()
+                feedback.set("Error copied to clipboard.")
+            except tk.TclError as exc:
+                feedback.set(f"Could not copy: {exc}")
+        tk.Button(footer, text="Copy error", command=copy_error, bg=p.get("accent", "#1261a0"), fg="#ffffff", activebackground=p.get("accent_active", p.get("accent", "#1261a0")), activeforeground="#ffffff", font=("Segoe UI Semibold", 10), padx=14, pady=6, relief="flat", borderwidth=0, highlightthickness=0).pack(side="left")
+        tk.Button(footer, text="Close", command=dialog.destroy, bg=p.get("card", "#ffffff"), fg=p.get("fg", "#243247"), activebackground=p.get("border", "#c5ccd6"), font=("Segoe UI Semibold", 10), padx=14, pady=6, relief="solid", borderwidth=1, highlightthickness=0).pack(side="right")
+        dialog.bind("<Control-c>", lambda _event: copy_error())
+        dialog.bind("<Control-C>", lambda _event: copy_error())
+        dialog.grab_set()
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
 
     def _system_dark_mode(self):
         try:
@@ -2100,7 +2149,7 @@ class App(tk.Tk):
             ignored = page_count - meaningful_page_count
             self.status.set(f"Draft read from {Path(path).name}: {page_count} pages, {len(machines)} machine(s), {ignored} blank/footer page(s) ignored. Review every value before filling the portal.")
         except Exception as e:
-            messagebox.showerror("Could not read PDF", str(e))
+            self._show_copyable_error("Could not read PDF", str(e))
 
     def _load_profile(self):
         self.accounts = list(self.profile.get("portal_accounts", []))
@@ -2134,7 +2183,7 @@ class App(tk.Tk):
             try:
                 save_vault(self.profile)
             except Exception as exc:
-                messagebox.showerror("Could not migrate saved account", str(exc))
+                self._show_copyable_error("Could not migrate saved account", str(exc))
 
     def _account_label(self, account):
         return account.get("username", "")
@@ -2217,7 +2266,7 @@ class App(tk.Tk):
                 image_data["name"] = Path(path).name
                 image_label.set(Path(path).name)
             except OSError as exc:
-                messagebox.showerror("Could not read PAN image", str(exc), parent=window)
+                self._show_copyable_error("Could not read PAN image", str(exc), parent=window)
 
         ttk.Label(pad, text="PAN card image").pack(anchor="w", pady=(8, 2))
         image_row = ttk.Frame(pad); image_row.pack(fill="x")
@@ -2294,7 +2343,7 @@ class App(tk.Tk):
             except Exception as exc:
                 self.accounts = old_accounts
                 self.profile["portal_accounts"] = old_accounts
-                messagebox.showerror("Could not save account", str(exc), parent=window)
+                self._show_copyable_error("Could not save account", str(exc), parent=window)
                 return
             self._refresh_accounts(match_index)
             self.status.set(f"Saved encrypted account for {email}.")
@@ -2321,7 +2370,7 @@ class App(tk.Tk):
             self.status.set("Opening bundled Chromium and filling saved sign-in. Enter the CAPTCHA in that window; a reviewed PDF draft will continue automatically after login." if has_draft else "Opening bundled Chromium and filling saved sign-in. Enter the CAPTCHA there. Read the PDF draft, then choose Fill now / retry after login.")
         except Exception as exc:
             self.status.set(f"Could not start Chromium: {exc}")
-            messagebox.showerror("Could not start Chromium", str(exc))
+            self._show_copyable_error("Could not start Chromium", str(exc))
 
     def _ensure_worker(self):
         if not self.worker or not self.worker.is_alive(): self.worker = PortalWorker(self.msgq)
@@ -2342,7 +2391,7 @@ class App(tk.Tk):
             self.status.set("Filling the application in bundled Chromium. If you are not signed in, the browser will open for CAPTCHA first.")
         except Exception as exc:
             self.status.set(f"Could not start Chromium: {exc}")
-            messagebox.showerror("Could not start Chromium", str(exc))
+            self._show_copyable_error("Could not start Chromium", str(exc))
 
     def _application_payload(self):
         fields = {k: v.get().strip() for k, v in self.vars.items()}
@@ -2404,7 +2453,7 @@ class App(tk.Tk):
             while True:
                 kind, value = self.msgq.get_nowait()
                 if kind == "error":
-                    self.status.set(value); messagebox.showerror("Automation stopped", value)
+                    self.status.set(value); self._show_copyable_error("Automation stopped", value)
                 elif kind == "details":
                     self.status.set(f"Filled: {', '.join(value['filled']) or 'none'}. Uploaded: {', '.join(value['uploaded']) or 'none'}. Needs manual review: {', '.join(value['skipped']) or 'no unmatched fields reported'}.")
                     if not value.get("automatic"):
