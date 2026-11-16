@@ -9,7 +9,7 @@ A local Windows desktop helper for preparing Tamil Nadu Legal Metrology weighing
 - Groups identical instrument types for the portal item list while keeping per-machine denomination, capacities, class, make, model, machine number, and CV reference for the later machine-detail page.
 - Saves portal credentials and each account's PAN details/image in the Windows DPAPI-encrypted profile for the current Windows account.
 - Opens bundled Chromium, fills the selected saved login, and waits for you to complete CAPTCHA. It then advances through the establishment, item/previous-information, and machine-detail pages.
-- Uploads the selected Previous CV, repairer license copy, owner authorisation letter, and PAN image from the selected account.
+- Uploads the selected Previous CV and owner authorisation letter, plus the PAN image from the selected account.
 - Stops at the final review page. **Submit application** asks for confirmation before making the official submission. It does not make a payment.
 
 ## Build the EXE
@@ -23,7 +23,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\build.ps1
 ```
 
-The executable will be created at `dist\TN_Stamping_Assistant_v36.exe`. The build script downloads Python packages into `.build-deps`, downloads Chromium into `.pw-browsers`, and bundles both with PyInstaller.
+The executable will be created at `dist\TN_Stamping_Assistant_v37.exe`. The build script downloads Python packages into `.build-deps`, downloads Chromium into `.pw-browsers`, and bundles both with PyInstaller.
 
 To run from source instead:
 
