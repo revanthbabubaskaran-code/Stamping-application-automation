@@ -23,7 +23,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\build.ps1
 ```
 
-The executable will be created at `dist\TN_Stamping_Assistant_v37.exe`. The build script downloads Python packages into `.build-deps`, downloads Chromium into `.pw-browsers`, and bundles both with PyInstaller.
+Automation and setup errors appear in a selectable text window with a **Copy error** button. The executable will be created at `dist\TN_Stamping_Assistant_v39.exe`. The build script downloads Python packages into `.build-deps`, downloads Chromium into `.pw-browsers`, and bundles both with PyInstaller.
 
 To run from source instead:
 
