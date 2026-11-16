@@ -89,7 +89,6 @@ PORTAL_IDS = {
     "PAN number": "#pan-number",
     "PAN date": "#pan-date",
     "Quantity": "#stampinglabourmeasures-0-quantity",
-    "Applicant contact name": "#applicant-name",
     "Registered name": "#userlogname",
     "Registered email": "#userlogemail",
     "Registered mobile": "#userlogemobile",
@@ -771,7 +770,7 @@ class PortalWorker(threading.Thread):
             heading = self.page.get_by_text(re.compile(heading_pattern, re.I)).first
             heading_top = float(heading.evaluate("el => el.getBoundingClientRect().top")) if heading.count() else float("-inf")
             candidates = []
-            for label in scope.locator("label").all():
+            for label in scope.locator("label,.control-label,[class*=label]").all():
                 if not label.is_visible():
                     continue
                 label_text = self._norm(label.inner_text())
@@ -901,7 +900,7 @@ class PortalWorker(threading.Thread):
             "Door number": r"door\s+number",
             "Pincode": r"pincode|pin\s+code",
         }
-        excluded = set(LOCAL_ONLY_FIELDS) | {"Applicant business name", "Used by / trader contact", "Trader / establishment number"}
+        excluded = set(LOCAL_ONLY_FIELDS) | {"Applicant business name", "Applicant contact name", "Used by / trader contact", "Trader / establishment number"}
         for field, value in fields.items():
             if not value or field in excluded:
                 continue
@@ -1083,8 +1082,14 @@ class PortalWorker(threading.Thread):
                 # The portal inserts the site fee selector only after Site has
                 # been selected. Resolve it then, before moving further down.
                 if field == "Stamping office/site" and str(value).lower() == "site":
-                    page.wait_for_timeout(350)
-                    dormant = self._field_for(["Dormant / Other", "Dormant / other", "Dormant"])
+                    dormant = None
+                    deadline = time.monotonic() + 8
+                    while time.monotonic() < deadline and dormant is None:
+                        candidate = self._field_for(["Dormant / Other", "Dormant / other", "Dormant"])
+                        if candidate is not None and candidate.count() and candidate.first.is_visible():
+                            dormant = candidate.first
+                            break
+                        page.wait_for_timeout(250)
                     if dormant is not None and dormant.count() and dormant.first.is_visible():
                         dormant_top = float(dormant.first.evaluate("el => el.getBoundingClientRect().top"))
                         pending_actions.append((dormant_top, "Site Dormant / Other choice", dormant.first, fields.get("Dormant / Other", "Other"), "field"))
@@ -1321,7 +1326,19 @@ class PortalWorker(threading.Thread):
             for control in scope.locator("input,select,textarea").all():
                 if not control.is_visible():
                     continue
-                metadata = control.evaluate("el => [...(el.labels || [])].map(label => label.innerText).join(' ')")
+                metadata = control.evaluate(r"""el => {
+                    const own = [...(el.labels || [])].map(label => label.innerText || '');
+                    let nearby = '';
+                    let node = el;
+                    for (let depth = 0; node && depth < 5; depth++, node = node.parentElement) {
+                        const labels = [...node.querySelectorAll('label,.control-label,[class*=label]')]
+                            .filter(label => label !== el && label.getClientRects().length)
+                            .map(label => label.innerText || label.textContent || '')
+                            .filter(Boolean);
+                        if (labels.length) { nearby = labels.join(' '); break; }
+                    }
+                    return [...own, nearby].join(' ');
+                }""")
                 metadata = " ".join(filter(None, [metadata, control.get_attribute("id"), control.get_attribute("name"), control.get_attribute("placeholder"), control.get_attribute("aria-label"), control.get_attribute("title")]))
                 if re.search(pattern, metadata, re.I):
                     matches.append(control)
@@ -1354,6 +1371,11 @@ class PortalWorker(threading.Thread):
                 day, month, year = date_match.groups()
                 value = f"{year}-{int(month):02d}-{int(day):02d}"
         control.fill(value)
+        # Some portal fields trigger dependent values (notably certificate
+        # dates) on change/blur rather than on the programmatic fill alone.
+        control.dispatch_event("input")
+        control.dispatch_event("change")
+        control.evaluate("el => el.blur()")
         return True
 
     def _fill_items_and_previous_information(self, groups, machines, skipped, filled):
@@ -1420,7 +1442,7 @@ class PortalWorker(threading.Thread):
                     continue
             return controls
 
-        def wait_for_count(getter, required, timeout=12):
+        def wait_for_count(getter, required, timeout=30):
             deadline = time.monotonic() + timeout
             current = getter()
             while len(current) < required and time.monotonic() < deadline:
@@ -1502,7 +1524,7 @@ class PortalWorker(threading.Thread):
             # Certificate date is computed by the portal after both identifiers.
             dates = self._controls_matching(previous_scope, r"certificate\s*date|previous\s*cv\s*date")
             if index < len(dates):
-                deadline = time.monotonic() + 10
+                deadline = time.monotonic() + 30
                 while time.monotonic() < deadline:
                     try:
                         certificate_date = dates[index].input_value().strip()
@@ -2476,3 +2498,4 @@ class App(tk.Tk):
 
 if __name__ == "__main__":
     App().mainloop()
+
