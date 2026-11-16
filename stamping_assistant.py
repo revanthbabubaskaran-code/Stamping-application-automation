@@ -100,6 +100,11 @@ PORTAL_IDS = {
     "Used by / trader contact": "#trader-name",
 }
 
+PORTAL_ID_ALIASES = {
+    "Repairer licence number": ("#licenceno", "#license-no", "#license-number", "#licence-number"),
+    "Repairer name": ("#repairer-name", "#repaired-by", "#repairedbyname"),
+}
+
 LOCAL_ONLY_FIELDS = {
     "Business address", "Denomination", "Instrument make", "Instrument model", "Machine number",
     "Maximum capacity", "Minimum capacity", "Verification interval (e/d)", "Class", "Application number", "Dormant / Other",
@@ -406,7 +411,8 @@ class PortalWorker(threading.Thread):
                             report["automatic"] = True
                             self.messages.put(("details", report))
                             if report["required_blank"]:
-                                self.messages.put(("error", "The form is filled, but required fields remain blank. Complete those fields in the app browser; the application was not submitted."))
+                                missing = "; ".join(report["required_blank"][:16])
+                                self.messages.put(("error", f"The portal page is still incomplete. Missing or unconfirmed: {missing}. Complete those fields in the app browser; the application was not submitted."))
                             elif not report.get("final_submit_visible"):
                                 self.messages.put(("error", "The portal did not reach a page with a visible Submit control. Review the fields reported as skipped, then use Fill now / retry; nothing was submitted."))
                             else:
@@ -437,7 +443,8 @@ class PortalWorker(threading.Thread):
                             report = self._fill_form(payload)
                             self.messages.put(("details", report))
                             if report["required_blank"]:
-                                self.messages.put(("error", "The form is filled, but required fields remain blank. Complete those fields in the app browser; the application was not submitted."))
+                                missing = "; ".join(report["required_blank"][:16])
+                                self.messages.put(("error", f"The portal page is still incomplete. Missing or unconfirmed: {missing}. Complete those fields in the app browser; the application was not submitted."))
                             elif not report.get("final_submit_visible"):
                                 self.messages.put(("error", "The portal did not reach a page with a visible Submit control. Review the fields reported as skipped, then use Fill now / retry; nothing was submitted."))
                             else:
@@ -714,39 +721,83 @@ class PortalWorker(threading.Thread):
                     nested = label.locator("input,select,textarea").first
                     if nested.count() and nested.is_visible():
                         return nested
+                    nearby = self._control_near_label(label)
+                    if nearby is not None:
+                        return nearby
             except Exception:
                 continue
         return None
 
+    def _control_near_label(self, label, scope=None, selector="input:not([type='hidden']),select,textarea"):
+        """Resolve unassociated Bootstrap labels by their nearest following control."""
+        root = scope or self.page
+        try:
+            label_top = float(label.evaluate("el => el.getBoundingClientRect().top"))
+            candidates = []
+            for control in root.locator(selector).all():
+                if not control.is_visible():
+                    continue
+                top = float(control.evaluate("el => el.getBoundingClientRect().top"))
+                gap = top - label_top
+                if -4 <= gap <= 125:
+                    candidates.append((abs(gap), control))
+            return min(candidates, key=lambda item: item[0])[1] if candidates else None
+        except Exception:
+            return None
+
     def _portal_field(self, field):
         """Prefer a visible known ID, then fall back to the portal's visible label."""
-        selector = PORTAL_IDS.get(field)
-        if selector:
+        selectors = ([PORTAL_IDS[field]] if field in PORTAL_IDS else []) + list(PORTAL_ID_ALIASES.get(field, ()))
+        for selector in selectors:
             direct = self.page.locator(selector)
             try:
                 if direct.count() and direct.first.is_visible():
                     return direct.first
             except Exception:
                 pass
+        if field == "Repairer licence number":
+            for selector in ('input[placeholder*="TN/"]:visible', 'input[name*="licen" i]:visible', 'input[id*="licen" i]:visible'):
+                direct = self.page.locator(selector)
+                try:
+                    if direct.count() == 1:
+                        return direct.first
+                except Exception:
+                    pass
         return self._field_for(FIELD_LABELS.get(field, [field]))
 
     def _field_in_section(self, heading_pattern, label_pattern):
         scope = self._section_locator(heading_pattern)
         try:
+            heading = self.page.get_by_text(re.compile(heading_pattern, re.I)).first
+            heading_top = float(heading.evaluate("el => el.getBoundingClientRect().top")) if heading.count() else float("-inf")
+            candidates = []
             for label in scope.locator("label").all():
                 if not label.is_visible():
                     continue
                 label_text = self._norm(label.inner_text())
                 if not re.fullmatch(label_pattern, label_text, re.I):
                     continue
+                label_top = float(label.evaluate("el => el.getBoundingClientRect().top"))
+                # A broad ancestor can contain repeated labels from the license
+                # and manufacturer sections. Use the first matching control
+                # below this section's heading to stay in Establishment Details.
+                if label_top < heading_top:
+                    continue
                 target_id = label.get_attribute("for")
                 if target_id:
                     control = self.page.locator(f"#{target_id}")
                     if control.count() and control.first.is_visible():
-                        return control.first
+                        candidates.append((label_top, control.first))
+                        continue
                 nested = label.locator("input,select,textarea").first
                 if nested.count() and nested.is_visible():
-                    return nested
+                    candidates.append((label_top, nested))
+                    continue
+                nearby = self._control_near_label(label, scope)
+                if nearby is not None:
+                    candidates.append((label_top, nearby))
+            if candidates:
+                return min(candidates, key=lambda item: item[0])[1]
         except Exception:
             pass
         return None
@@ -777,13 +828,9 @@ class PortalWorker(threading.Thread):
 
         if self.workflow_step <= 0:
             self._fill_establishment_page(fields, machines, payload, report)
-            self._collect_visible_required(report)
-            if report["required_blank"]:
-                return report
-            self._click_next("item and previous-information page")
-            self.workflow_step = 1
-
         if self.workflow_step <= 1:
+            # Items and Previous Information are lower sections on this same
+            # first portal page. Fill them before validating or clicking Next.
             self._fill_items_and_previous_information(groups, machines, report["skipped"], report["filled"])
             filled_items = set(report["filled"])
             for index, _group in enumerate(groups, 1):
@@ -791,12 +838,15 @@ class PortalWorker(threading.Thread):
                     report["required_blank"].append(f"Item category {index} was not selected")
                 if not any(entry.startswith(f"Item quantity {index}:") for entry in filled_items):
                     report["required_blank"].append(f"Item quantity {index} total was not confirmed")
+            for index, _machine in enumerate(machines, 1):
                 if f"Previous Information Online {index}" not in filled_items:
                     report["required_blank"].append(f"Previous Information Online option for machine {index} was not selected")
                 if f"Previous Information Application number {index}" not in filled_items:
                     report["required_blank"].append(f"Previous Information Application number for machine {index} was not filled")
                 if f"Previous Information Certificate number {index}" not in filled_items:
                     report["required_blank"].append(f"Previous Information Certificate number for machine {index} was not filled")
+                if f"Previous Information Certificate date {index}" not in filled_items:
+                    report["required_blank"].append(f"Previous Information Certificate date for machine {index} was not populated by the portal")
             self._collect_visible_required(report)
             if report["required_blank"]:
                 return report
@@ -851,12 +901,15 @@ class PortalWorker(threading.Thread):
             "Door number": r"door\s+number",
             "Pincode": r"pincode|pin\s+code",
         }
-        excluded = set(LOCAL_ONLY_FIELDS) | {"Applicant business name", "Used by / trader contact"}
+        excluded = set(LOCAL_ONLY_FIELDS) | {"Applicant business name", "Used by / trader contact", "Trader / establishment number"}
         for field, value in fields.items():
             if not value or field in excluded:
                 continue
-            locator = (self._field_in_section(r"Establishment\s+Details", establishment_labels[field])
-                       if field in establishment_labels else self._portal_field(field))
+            # "Name" appears in several portal sections. Resolve the applicant
+            # name only inside Establishment Details, never by a page-wide ID.
+            locator = None if field == "Applicant / establishment name" else self._portal_field(field)
+            if (locator is None or field == "Applicant / establishment name") and field in establishment_labels:
+                locator = self._field_in_section(r"Establishment\s+Details", establishment_labels[field])
             try:
                 if locator is None or not locator.count() or not locator.first.is_visible():
                     report["skipped"].append(f"{field} (control not found or not visible)")
@@ -889,8 +942,10 @@ class PortalWorker(threading.Thread):
 
         applicant_name = fields.get("Applicant / establishment name", "")
         manufacturer_scope = self._section_locator(r"Manufacturer\s*/\s*Trader\s*/\s*Establishment")
-        establishment_controls = [control for control in self._controls_matching(manufacturer_scope, r"establishment\s*name")
-                                  if (control.get_attribute("id") or "").lower() != "establishmentname"]
+        establishment_controls = page.locator("#trader-est-name:visible").all()
+        if not establishment_controls:
+            establishment_controls = [control for control in self._controls_matching(manufacturer_scope, r"establishment\s*name")
+                                      if (control.get_attribute("id") or "").lower() != "establishmentname"]
         if applicant_name and establishment_controls:
             control = establishment_controls[0]
             try:
@@ -924,18 +979,9 @@ class PortalWorker(threading.Thread):
             except Exception as exc:
                 report["skipped"].append(f"{label} (could not locate control: {exc})")
 
-        if fields.get("Stamping office/site", "").lower() == "site":
-            dormant = self._field_for(["Dormant / Other", "Dormant / other", "Dormant"])
-            if dormant is not None and dormant.count():
-                try:
-                    actions.append((float(dormant.first.evaluate("el => el.getBoundingClientRect().top")), "Site Dormant / Other choice", dormant.first, fields.get("Dormant / Other", "Other"), "field"))
-                except Exception as exc:
-                    report["skipped"].append(f"Site Dormant / Other choice: {exc}")
-            else:
-                report["skipped"].append("Site Dormant / Other choice (control not found)")
-
         attachments = [
             ("Upload the purchase Invoice/Previous CV", "#pur-invo-file", payload.get("certificate")),
+            ("Upload Repairer License", "#repairer-license-file", payload.get("repairer_license")),
             ("Upload the Authorisation Letter from the user/owner", "#repairerletter", payload.get("authorization")),
             ("Upload copy of PAN card", "#pancard-file", payload.get("pan_image_data")),
         ]
@@ -944,6 +990,18 @@ class PortalWorker(threading.Thread):
                 continue
             locator = page.locator(selector)
             try:
+                if label == "Upload Repairer License" and not locator.count():
+                    for portal_label in page.locator("label").all():
+                        try:
+                            if not re.search(r"repairer\s+licen[cs]e", portal_label.inner_text(), re.I):
+                                continue
+                            target_id = portal_label.get_attribute("for")
+                            candidate = page.locator(f"#{target_id}") if target_id else portal_label.locator("input[type='file']")
+                            if candidate.count() and candidate.first.get_attribute("type") == "file":
+                                locator = candidate.first
+                                break
+                        except Exception:
+                            continue
                 if not locator.count():
                     report["skipped"].append(f"Upload: {label} (control not found)")
                     continue
@@ -957,7 +1015,26 @@ class PortalWorker(threading.Thread):
                 report["skipped"].append(f"Upload: {label}: {exc}")
 
         same_details_checked = False
-        pending_actions = sorted(actions, key=lambda action: action[0])
+        ordered_fields = [
+            "New goods / machine type choice", "Stamping office/site",
+            "Stamping purpose: Re-verification", "Applicant licence type: Repairer",
+            "Repairer name", "Site Dormant / Other choice", "Repairer licence number",
+            "Repairer licence date", "Licensed valid Up To", "Applicant business name",
+            "Registered name", "Registered email", "Registered mobile",
+            "Previous CV number", "Previous CV date",
+            "Upload the purchase Invoice/Previous CV", "Upload Repairer License",
+            "Upload the Authorisation Letter from the user/owner",
+            "Applicant / establishment name", "State", "District", "Taluk",
+            "Town / Village", "Street", "Door number", "Pincode",
+            "Same Details for Manufacturer / Trader / Establishment",
+            "Manufacturer / Trader establishment name", "Repaired by / Used by",
+            "PAN number", "PAN date", "Upload copy of PAN card",
+        ]
+        order_index = {name: index for index, name in enumerate(ordered_fields)}
+        def action_order(action):
+            top, name = action[0], action[1]
+            return (order_index.get(name, len(order_index)), top)
+        pending_actions = sorted(actions, key=action_order)
         while pending_actions:
             _top, field, locator, value, action_type = pending_actions.pop(0)
             try:
@@ -971,7 +1048,7 @@ class PortalWorker(threading.Thread):
                             if capacity.count() and capacity.first.is_visible():
                                 top = float(capacity.first.evaluate("el => el.getBoundingClientRect().top"))
                                 pending_actions.append((top, "Weighing machine capacity range", capacity.first, capacity_choice, "field"))
-                                pending_actions.sort(key=lambda action: action[0])
+                                pending_actions.sort(key=action_order)
                     else:
                         report["skipped"].append(field)
                     continue
@@ -987,7 +1064,7 @@ class PortalWorker(threading.Thread):
                 if action_type == "license-establishment":
                     license_establishment = page.locator("#establishmentname")
                     license_name = license_establishment.input_value().strip() if license_establishment.count() else ""
-                    value = license_name or fields.get("Used by / trader contact", "")
+                    value = (license_name.split(",", 1)[0].strip() if license_name else "") or fields.get("Used by / trader contact", "")
                     if not value:
                         report["skipped"].append("Repaired by / Used by (license establishment name unavailable)")
                         continue
@@ -1016,6 +1093,17 @@ class PortalWorker(threading.Thread):
                 elif not self._fill_control(locator, value):
                     report["skipped"].append(f"{field} (could not select {value})")
                     continue
+                # The portal inserts the site fee selector only after Site has
+                # been selected. Resolve it then, before moving further down.
+                if field == "Stamping office/site" and str(value).lower() == "site":
+                    page.wait_for_timeout(350)
+                    dormant = self._field_for(["Dormant / Other", "Dormant / other", "Dormant"])
+                    if dormant is not None and dormant.count() and dormant.first.is_visible():
+                        dormant_top = float(dormant.first.evaluate("el => el.getBoundingClientRect().top"))
+                        pending_actions.append((dormant_top, "Site Dormant / Other choice", dormant.first, fields.get("Dormant / Other", "Other"), "field"))
+                        pending_actions.sort(key=action_order)
+                    else:
+                        report["skipped"].append("Site Dormant / Other choice (control not found after selecting Site)")
                 if field == "Repairer licence number":
                     page.wait_for_timeout(1400)
                 elif field in {"State", "District", "Taluk", "Town / Village", "Street"}:
@@ -1035,7 +1123,7 @@ class PortalWorker(threading.Thread):
         critical_fields = (
             "Applicant / establishment name", "Stamping office/site", "Repairer licence number", "Repairer name",
             "Previous CV number", "Previous CV date", "State", "District", "Taluk", "Town / Village",
-            "Street", "Door number", "Pincode", "PAN name", "PAN number", "PAN date",
+            "Street", "Door number", "Pincode", "PAN number", "PAN date",
         )
         filled_names = set(report["filled"])
         for field in ("New goods / machine type choice", "Stamping purpose: Re-verification", "Applicant licence type: Repairer"):
@@ -1057,6 +1145,8 @@ class PortalWorker(threading.Thread):
         for label, _selector, file_path in attachments:
             if file_path and label not in report["uploaded"]:
                 report["required_blank"].append(f"Portal upload not completed: {label}")
+        if not payload.get("repairer_license"):
+            report["required_blank"].append("Choose the Repairer License copy in Documents before starting the application")
 
     @staticmethod
     def _capacity_kg(value: str) -> float:
@@ -1077,14 +1167,35 @@ class PortalWorker(threading.Thread):
             if checkbox.count():
                 return checkbox
         except Exception:
-            # Fall back to checkbox labels whose text includes the requested phrase.
-            for label in self.page.locator("label").all():
-                try:
-                    if re.search(r"Same Details for Manufacturer\s*/\s*Trader\s*/\s*Establishment", label.inner_text(), re.I):
-                        control = label.locator("input[type=checkbox]").first
-                        if control.count(): return control
-                except Exception:
-                    continue
+            pass
+        # Playwright may return zero matches without raising when the label wraps
+        # across lines or its whitespace differs from the accessible name.
+        for label in self.page.locator("label").all():
+            try:
+                text = re.sub(r"\s+", " ", label.inner_text()).strip()
+                if re.search(r"Same Details for Manufacturer\s*/\s*Trader\s*/\s*Establishment", text, re.I):
+                    control = label.locator("input[type=checkbox]").first
+                    if control.count(): return control
+                    target_id = label.get_attribute("for")
+                    if target_id:
+                        control = self.page.locator(f"#{target_id}")
+                        if control.count() and control.get_attribute("type") == "checkbox":
+                            return control.first
+                    nearby = self._control_near_label(label, selector="input[type=checkbox]")
+                    if nearby is not None:
+                        return nearby
+            except Exception:
+                continue
+        try:
+            text_match = self.page.get_by_text(re.compile(r"Same Details for Manufacturer\s*/\s*Trader\s*/\s*Establishment", re.I)).first
+            if text_match.count():
+                for depth in range(1, 5):
+                    scope = text_match.locator("xpath=" + "/".join([".."] * depth))
+                    checkbox = scope.locator('input[type="checkbox"]:visible').first
+                    if checkbox.count():
+                        return checkbox
+        except Exception:
+            pass
         return None
 
     def _check_same_details(self):
@@ -1111,20 +1222,50 @@ class PortalWorker(threading.Thread):
         if next_button is None:
             raise RuntimeError(f"Could not find the Next control for the {expected_page}. Review the current portal page.")
         previous_url = page.url
+        previous_signature = self._visible_form_signature()
         next_button.click(timeout=10000)
         try:
             page.wait_for_load_state("domcontentloaded", timeout=12000)
         except Exception:
             pass
-        page.wait_for_timeout(1000)
-        if page.url == previous_url and not re.search(r"submit|review|application", " ".join(visible_labels), re.I):
-            page.wait_for_timeout(900)
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            page.wait_for_timeout(250)
+            if page.url != previous_url or self._visible_form_signature() != previous_signature:
+                return
+        # A click can be accepted by the browser while portal validation keeps
+        # the user on the same step. Never advance the automation state then.
+        self._collect_visible_required({"required_blank": [], "skipped": []})
+        raise RuntimeError(
+            f"The portal did not advance to the {expected_page}. Its current page still appears incomplete; "
+            "review the highlighted required fields in the app browser."
+        )
+
+    def _visible_form_signature(self):
+        """Return a compact signature of the currently visible form step."""
+        try:
+            return tuple(self.page.locator(
+                "input:visible,select:visible,textarea:visible,button:visible,[role='button']:visible,h1:visible,h2:visible,h3:visible,h4:visible"
+            ).evaluate_all("els => els.map(e => [e.tagName, e.id || e.name || '', e.type || '', (e.innerText || e.value || e.getAttribute('aria-label') || '').trim().slice(0,80)])"))
+        except Exception:
+            return ()
 
     def _collect_visible_required(self, report):
         try:
-            blank = self.page.locator("input[required]:visible,select[required]:visible,textarea[required]:visible").evaluate_all(
-                "els => els.filter(e => !e.disabled && !e.readOnly && ((e.type === 'checkbox' || e.type === 'radio') ? !e.checked : !e.value)).map(e => e.id || e.name || e.type)"
-            )
+            blank = self.page.locator("input:visible,select:visible,textarea:visible").evaluate_all(r"""els => els.filter(e => {
+                if (e.disabled || e.readOnly) return false;
+                const label = [...(e.labels || [])].map(x => x.innerText || '').join(' ');
+                const group = e.closest('.form-group,.form-row,.mb-3,.field,td') || e.parentElement;
+                const nearby = group ? [...group.querySelectorAll('label,.control-label,[class*=label]')].map(x => x.innerText || '').join(' ') : '';
+                const required = e.required || e.getAttribute('aria-required') === 'true' || /\*/.test(label + ' ' + nearby) || e.classList.contains('is-invalid');
+                if (!required) return false;
+                if (e.type === 'checkbox' || e.type === 'radio') return !e.checked;
+                if (e.tagName === 'SELECT') {
+                    const selected = e.options[e.selectedIndex];
+                    return !selected || !e.value || /^(select|choose|--|please select)/i.test((selected.textContent || '').trim());
+                }
+                return !String(e.value || '').trim();
+            }).map(e => e.id || e.name || e.type || e.tagName)""")
             report["required_blank"] = list(dict.fromkeys(report["required_blank"] + blank))
             report["skipped"].extend(f"Required field left blank: {name}" for name in blank if f"Required field left blank: {name}" not in report["skipped"])
         except Exception:
@@ -1307,34 +1448,35 @@ class PortalWorker(threading.Thread):
             skipped.append("Previous Information: Online/Other State control not found")
             return
 
+        shared_application_number = next((str(row.get("Application number", "")).strip() for row in machines if str(row.get("Application number", "")).strip()), "")
+
         for index, machine in enumerate(machines):
             states = online_controls()
             if index == 0:
                 state_control = states[0] if states else None
             else:
-                model_index = index - 1
                 models = self._controls_matching(previous_scope, model_pattern)
-                if len(models) <= model_index and len(states) <= index:
+                if len(states) <= index:
+                    previous_model_count = len(models)
                     add = self._add_button(previous_scope)
                     if add is not None:
                         try:
                             add.click()
-                            page.wait_for_timeout(350)
+                            deadline = time.monotonic() + 10
+                            while time.monotonic() < deadline:
+                                models = self._controls_matching(previous_scope, model_pattern)
+                                if len(models) > previous_model_count:
+                                    break
+                                page.wait_for_timeout(200)
                         except Exception as exc:
                             skipped.append(f"Previous Information: could not add machine section {index + 1}: {exc}")
                     else:
                         skipped.append(f"Previous Information: Add More control not found for machine {index + 1}")
-                    deadline = time.monotonic() + 10
-                    while time.monotonic() < deadline:
-                        models = self._controls_matching(previous_scope, model_pattern)
-                        states = online_controls()
-                        if len(models) > model_index or len(states) > index:
-                            break
-                        page.wait_for_timeout(250)
-
                 models = self._controls_matching(previous_scope, model_pattern)
-                if len(models) > model_index:
-                    model_control = models[model_index]
+                if models:
+                    # Model controls become Online/Other State selectors after
+                    # selection. Always target the newest visible model row.
+                    model_control = models[-1]
                     model_value = machine.get("Instrument description", "")
                     selected_model = self._select_best(model_control, model_value)
                     if not selected_model:
@@ -1344,6 +1486,9 @@ class PortalWorker(threading.Thread):
                     else:
                         skipped.append(f"Previous Information Model for machine {index + 1}")
                     states = wait_for_count(online_controls, index + 1)
+                else:
+                    skipped.append(f"Previous Information Model for machine {index + 1}")
+                    states = online_controls()
                 state_control = states[index] if len(states) > index else None
 
             if state_control is None or not self._select_best(state_control, "Online"):
@@ -1354,7 +1499,7 @@ class PortalWorker(threading.Thread):
 
             apps = wait_for_count(lambda: self._controls_matching(previous_scope, app_pattern), index + 1)
             cvs = wait_for_count(lambda: self._controls_matching(previous_scope, cv_pattern), index + 1)
-            app_no = machine.get("Application number", "")
+            app_no = machine.get("Application number", "") or shared_application_number
             cv_no = machine.get("Previous CV number", "")
             for label, controls, value in (("Application number", apps, app_no), ("Certificate number", cvs, cv_no)):
                 if index >= len(controls) or not value:
@@ -1375,11 +1520,17 @@ class PortalWorker(threading.Thread):
                 deadline = time.monotonic() + 10
                 while time.monotonic() < deadline:
                     try:
-                        if dates[index].input_value().strip():
+                        certificate_date = dates[index].input_value().strip()
+                        if certificate_date:
+                            filled.append(f"Previous Information Certificate date {index + 1}")
                             break
                     except Exception:
                         break
                     page.wait_for_timeout(300)
+                else:
+                    skipped.append(f"Previous Information Certificate date for machine {index + 1} (portal did not populate it)")
+            else:
+                skipped.append(f"Previous Information Certificate date for machine {index + 1} (control not found)")
 
     def _select_first_available(self, control):
         try:
@@ -1727,7 +1878,7 @@ class App(tk.Tk):
             self.profile = load_vault()
         except Exception as e:
             messagebox.showerror("Profile could not be opened", f"Encrypted profile could not be read. It may belong to another Windows user.\n\n{e}")
-        self.files = {"certificate": "", "authorization": ""}
+        self.files = {"certificate": "", "repairer_license": "", "authorization": ""}
         self.vars = {}
         self.machine_rows = []
         self.machine_metadata = []
@@ -1850,6 +2001,7 @@ class App(tk.Tk):
 
         docs = self._card(body, "Documents")
         self._file_row(docs, "Purchase invoice / Previous CV (PDF)", "certificate", ("PDF files", "*.pdf"))
+        self._file_row(docs, "Repairer license copy", "repairer_license", ("PDF or image", "*.pdf *.jpg *.jpeg *.bmp"))
         self._file_row(docs, "Authorisation letter from user / owner", "authorization", ("PDF or image", "*.pdf *.jpg *.jpeg *.png"))
         ttk.Label(docs, text="PAN card image is uploaded from the selected account. Portal file uploads must be under 1 MB.", style="Muted.Card.TLabel").pack(anchor="w", pady=(8, 0))
 
@@ -2249,7 +2401,7 @@ class App(tk.Tk):
             group = grouped.setdefault(key, {"description": description, "quantity": 0, "machines": []})
             group["quantity"] += _item_count(row.get("Quantity", ""))
             group["machines"].append(row)
-        return {"fields": fields, "machine_rows": machine_rows, "item_groups": list(grouped.values()), "certificate": self.files.get("certificate"), "authorization": self.files.get("authorization"), "pan_image_data": image_payload}
+        return {"fields": fields, "machine_rows": machine_rows, "item_groups": list(grouped.values()), "certificate": self.files.get("certificate"), "repairer_license": self.files.get("repairer_license"), "authorization": self.files.get("authorization"), "pan_image_data": image_payload}
 
     def submit_application(self):
         if not self.worker or not self.worker.is_alive():
@@ -2291,4 +2443,3 @@ class App(tk.Tk):
 
 if __name__ == "__main__":
     App().mainloop()
-
