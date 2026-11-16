@@ -981,7 +981,6 @@ class PortalWorker(threading.Thread):
 
         attachments = [
             ("Upload the purchase Invoice/Previous CV", "#pur-invo-file", payload.get("certificate")),
-            ("Upload Repairer License", "#repairer-license-file", payload.get("repairer_license")),
             ("Upload the Authorisation Letter from the user/owner", "#repairerletter", payload.get("authorization")),
             ("Upload copy of PAN card", "#pancard-file", payload.get("pan_image_data")),
         ]
@@ -990,18 +989,6 @@ class PortalWorker(threading.Thread):
                 continue
             locator = page.locator(selector)
             try:
-                if label == "Upload Repairer License" and not locator.count():
-                    for portal_label in page.locator("label").all():
-                        try:
-                            if not re.search(r"repairer\s+licen[cs]e", portal_label.inner_text(), re.I):
-                                continue
-                            target_id = portal_label.get_attribute("for")
-                            candidate = page.locator(f"#{target_id}") if target_id else portal_label.locator("input[type='file']")
-                            if candidate.count() and candidate.first.get_attribute("type") == "file":
-                                locator = candidate.first
-                                break
-                        except Exception:
-                            continue
                 if not locator.count():
                     report["skipped"].append(f"Upload: {label} (control not found)")
                     continue
@@ -1022,7 +1009,7 @@ class PortalWorker(threading.Thread):
             "Repairer licence date", "Licensed valid Up To", "Applicant business name",
             "Registered name", "Registered email", "Registered mobile",
             "Previous CV number", "Previous CV date",
-            "Upload the purchase Invoice/Previous CV", "Upload Repairer License",
+            "Upload the purchase Invoice/Previous CV",
             "Upload the Authorisation Letter from the user/owner",
             "Applicant / establishment name", "State", "District", "Taluk",
             "Town / Village", "Street", "Door number", "Pincode",
@@ -1145,8 +1132,6 @@ class PortalWorker(threading.Thread):
         for label, _selector, file_path in attachments:
             if file_path and label not in report["uploaded"]:
                 report["required_blank"].append(f"Portal upload not completed: {label}")
-        if not payload.get("repairer_license"):
-            report["required_blank"].append("Choose the Repairer License copy in Documents before starting the application")
 
     @staticmethod
     def _capacity_kg(value: str) -> float:
@@ -1878,7 +1863,7 @@ class App(tk.Tk):
             self.profile = load_vault()
         except Exception as e:
             messagebox.showerror("Profile could not be opened", f"Encrypted profile could not be read. It may belong to another Windows user.\n\n{e}")
-        self.files = {"certificate": "", "repairer_license": "", "authorization": ""}
+        self.files = {"certificate": "", "authorization": ""}
         self.vars = {}
         self.machine_rows = []
         self.machine_metadata = []
@@ -2001,7 +1986,6 @@ class App(tk.Tk):
 
         docs = self._card(body, "Documents")
         self._file_row(docs, "Purchase invoice / Previous CV (PDF)", "certificate", ("PDF files", "*.pdf"))
-        self._file_row(docs, "Repairer license copy", "repairer_license", ("PDF or image", "*.pdf *.jpg *.jpeg *.bmp"))
         self._file_row(docs, "Authorisation letter from user / owner", "authorization", ("PDF or image", "*.pdf *.jpg *.jpeg *.png"))
         ttk.Label(docs, text="PAN card image is uploaded from the selected account. Portal file uploads must be under 1 MB.", style="Muted.Card.TLabel").pack(anchor="w", pady=(8, 0))
 
@@ -2401,7 +2385,7 @@ class App(tk.Tk):
             group = grouped.setdefault(key, {"description": description, "quantity": 0, "machines": []})
             group["quantity"] += _item_count(row.get("Quantity", ""))
             group["machines"].append(row)
-        return {"fields": fields, "machine_rows": machine_rows, "item_groups": list(grouped.values()), "certificate": self.files.get("certificate"), "repairer_license": self.files.get("repairer_license"), "authorization": self.files.get("authorization"), "pan_image_data": image_payload}
+        return {"fields": fields, "machine_rows": machine_rows, "item_groups": list(grouped.values()), "certificate": self.files.get("certificate"), "authorization": self.files.get("authorization"), "pan_image_data": image_payload}
 
     def submit_application(self):
         if not self.worker or not self.worker.is_alive():
