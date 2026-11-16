@@ -23,7 +23,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\build.ps1
 ```
 
-Automation and setup errors appear in a selectable text window with a **Copy error** button. The executable will be created at `dist\TN_Stamping_Assistant_v39.exe`. The build script downloads Python packages into `.build-deps`, downloads Chromium into `.pw-browsers`, and bundles both with PyInstaller.
+Automation and setup errors appear in a selectable text window with a **Copy error** button. The executable will be created at `dist\TN_Stamping_Assistant_v40.exe`. The build script downloads Python packages into `.build-deps`, downloads Chromium into `.pw-browsers`, and bundles both with PyInstaller.
 
 To run from source instead:
 
@@ -50,3 +50,4 @@ Use the mouse wheel or the vertical scrollbar to navigate the application UI. Th
 - Portal field labels and layout can change. The app reports unmatched fields and required values; verify the portal pages and uploaded documents before submitting.
 - CAPTCHA completion, final submission confirmation, any legal declaration that the portal requires, and payment remain user-controlled.
 - The encrypted profile is bound to the current Windows account on this PC. If Windows profile access is lost, saved values cannot be decrypted. To remove it, delete `%LOCALAPPDATA%\TNStampingAssistant\profile.vault` in Windows Explorer.
+
