@@ -27,6 +27,7 @@ PORTAL_URL = "https://labour.tn.gov.in/services/users/login?redirect=%2Fstamping
 STAMPING_URL = "https://labour.tn.gov.in/services/stamping-labours/stamping"
 APP_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "TNStampingAssistant"
 VAULT_FILE = APP_DIR / "profile.vault"
+FALLBACK_APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent) / ".TNStampingAssistant"
 if getattr(sys, "frozen", False):
     os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(Path(sys._MEIPASS) / ".pw-browsers")
 else:
@@ -163,16 +164,37 @@ def unprotect(data: bytes) -> bytes:
 
 
 def load_vault() -> dict:
-    if not VAULT_FILE.exists():
-        return {}
-    return json.loads(unprotect(VAULT_FILE.read_bytes()).decode("utf-8"))
+    global APP_DIR, VAULT_FILE
+    candidates = (VAULT_FILE, FALLBACK_APP_DIR / "profile.vault")
+    for candidate in candidates:
+        if candidate.exists():
+            profile = json.loads(unprotect(candidate.read_bytes()).decode("utf-8"))
+            APP_DIR, VAULT_FILE = candidate.parent, candidate
+            return profile
+    return {}
 
 
 def save_vault(data: dict) -> None:
-    APP_DIR.mkdir(parents=True, exist_ok=True)
-    temp = VAULT_FILE.with_suffix(".tmp")
-    temp.write_bytes(protect(json.dumps(data, ensure_ascii=False).encode("utf-8")))
-    os.replace(temp, VAULT_FILE)
+    global APP_DIR, VAULT_FILE
+    encrypted = protect(json.dumps(data, ensure_ascii=False).encode("utf-8"))
+    candidates = tuple(dict.fromkeys((APP_DIR, FALLBACK_APP_DIR)))
+    last_error = None
+    for directory in candidates:
+        target = directory / "profile.vault"
+        temp = target.with_suffix(".tmp")
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            temp.write_bytes(encrypted)
+            os.replace(temp, target)
+            APP_DIR, VAULT_FILE = directory, target
+            return
+        except OSError as exc:
+            last_error = exc
+            try:
+                temp.unlink(missing_ok=True)
+            except OSError:
+                pass
+    raise last_error or OSError("Could not save the encrypted profile.")
 
 
 def pdf_text(path: str) -> str:
@@ -1902,6 +1924,62 @@ class App(tk.Tk):
         self._apply_theme(self._system_dark_mode())
         style.configure("TButton", font=("Segoe UI Semibold", 10), padding=(12, 8))
 
+    @staticmethod
+    def _copy_text_to_clipboard(value, widget):
+        if os.name != "nt":
+            widget.clipboard_clear()
+            widget.clipboard_append(value)
+            widget.update()
+            return
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        user32.OpenClipboard.argtypes = [wintypes.HWND]
+        user32.OpenClipboard.restype = wintypes.BOOL
+        user32.EmptyClipboard.restype = wintypes.BOOL
+        user32.SetClipboardData.argtypes = [wintypes.UINT, ctypes.c_void_p]
+        user32.SetClipboardData.restype = ctypes.c_void_p
+        user32.CloseClipboard.restype = wintypes.BOOL
+        kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+        kernel32.GlobalAlloc.restype = ctypes.c_void_p
+        kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+        kernel32.GlobalLock.restype = ctypes.c_void_p
+        kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+        kernel32.GlobalUnlock.restype = wintypes.BOOL
+        kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+        kernel32.GlobalFree.restype = ctypes.c_void_p
+
+        opened = False
+        for _ in range(12):
+            if user32.OpenClipboard(None):
+                opened = True
+                break
+            time.sleep(0.05)
+        if not opened:
+            raise ctypes.WinError(ctypes.get_last_error())
+        handle = None
+        transferred = False
+        try:
+            if not user32.EmptyClipboard():
+                raise ctypes.WinError(ctypes.get_last_error())
+            payload = (value + "\0").encode("utf-16-le")
+            handle = kernel32.GlobalAlloc(0x0002, len(payload))  # GMEM_MOVEABLE
+            if not handle:
+                raise ctypes.WinError(ctypes.get_last_error())
+            pointer = kernel32.GlobalLock(handle)
+            if not pointer:
+                raise ctypes.WinError(ctypes.get_last_error())
+            try:
+                ctypes.memmove(pointer, payload, len(payload))
+            finally:
+                kernel32.GlobalUnlock(handle)
+            if not user32.SetClipboardData(13, handle):  # CF_UNICODETEXT
+                raise ctypes.WinError(ctypes.get_last_error())
+            transferred = True
+        finally:
+            user32.CloseClipboard()
+            if handle and not transferred:
+                kernel32.GlobalFree(handle)
+
     def _show_copyable_error(self, title, message, parent=None):
         """Show an error in selectable text with a one-click copy action."""
         p = getattr(self, "palette", {"bg": "#f3f6fa", "card": "#ffffff", "fg": "#243247", "border": "#c5ccd6", "selection": "#b7d7f0"})
@@ -1929,7 +2007,8 @@ class App(tk.Tk):
         text.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
         text.insert("1.0", str(message))
-        text.configure(state="disabled")
+        # Keep it read-only while allowing standard selection and copy keys.
+        text.bind("<Key>", lambda event: None if event.state & 0x4 and event.keysym.lower() in {"a", "c"} else "break")
         text.tag_add("sel", "1.0", "end-1c")
         text.focus_set()
         feedback = tk.StringVar(value="")
@@ -1938,13 +2017,31 @@ class App(tk.Tk):
         ttk.Label(footer, textvariable=feedback).pack(side="left")
         def copy_error():
             try:
-                dialog.clipboard_clear()
-                dialog.clipboard_append(str(message))
-                dialog.update_idletasks()
-                feedback.set("Error copied to clipboard.")
-            except tk.TclError as exc:
-                feedback.set(f"Could not copy: {exc}")
+                self._copy_text_to_clipboard(str(message), dialog)
+                feedback.set("Copied. Paste with Ctrl+V.")
+            except Exception as native_exc:
+                try:
+                    dialog.clipboard_clear()
+                    dialog.clipboard_append(str(message))
+                    dialog.update()
+                    if dialog.clipboard_get() != str(message):
+                        raise tk.TclError("Clipboard verification failed")
+                    feedback.set("Copied. Paste with Ctrl+V.")
+                except Exception as tk_exc:
+                    text.tag_add("sel", "1.0", "end-1c")
+                    text.focus_set()
+                    feedback.set(f"Windows blocked clipboard access ({native_exc}; {tk_exc}). The error is selected: press Ctrl+C or choose Save error…")
+        def save_error():
+            path = filedialog.asksaveasfilename(parent=dialog, title="Save error message", defaultextension=".txt", initialfile="stamping_error.txt", filetypes=[("Text files", "*.txt")])
+            if not path:
+                return
+            try:
+                Path(path).write_text(str(message), encoding="utf-8")
+                feedback.set(f"Saved error text to {path}")
+            except OSError as exc:
+                feedback.set(f"Could not save error text: {exc}")
         tk.Button(footer, text="Copy error", command=copy_error, bg=p.get("accent", "#1261a0"), fg="#ffffff", activebackground=p.get("accent_active", p.get("accent", "#1261a0")), activeforeground="#ffffff", font=("Segoe UI Semibold", 10), padx=14, pady=6, relief="flat", borderwidth=0, highlightthickness=0).pack(side="left")
+        tk.Button(footer, text="Save error…", command=save_error, bg=p.get("card", "#ffffff"), fg=p.get("fg", "#243247"), activebackground=p.get("border", "#c5ccd6"), font=("Segoe UI Semibold", 10), padx=14, pady=6, relief="solid", borderwidth=1, highlightthickness=0).pack(side="left", padx=(8, 0))
         tk.Button(footer, text="Close", command=dialog.destroy, bg=p.get("card", "#ffffff"), fg=p.get("fg", "#243247"), activebackground=p.get("border", "#c5ccd6"), font=("Segoe UI Semibold", 10), padx=14, pady=6, relief="solid", borderwidth=1, highlightthickness=0).pack(side="right")
         dialog.bind("<Control-c>", lambda _event: copy_error())
         dialog.bind("<Control-C>", lambda _event: copy_error())
