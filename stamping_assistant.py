@@ -14,6 +14,7 @@ import re
 import threading
 import mimetypes
 import sys
+import subprocess
 import time
 import winreg
 from difflib import SequenceMatcher
@@ -28,6 +29,7 @@ STAMPING_URL = "https://labour.tn.gov.in/services/stamping-labours/stamping"
 APP_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "TNStampingAssistant"
 VAULT_FILE = APP_DIR / "profile.vault"
 FALLBACK_APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent) / ".TNStampingAssistant"
+ADDRESS_CACHE_LOCK = threading.Lock()
 if getattr(sys, "frozen", False):
     os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(Path(sys._MEIPASS) / ".pw-browsers")
 else:
@@ -329,11 +331,60 @@ def extract_certificate_document(path: str) -> tuple[int, int, dict[str, str], l
     return page_count, len(pages), values, machines
 
 
+def _locality_components(address: str) -> dict:
+    """Split a locality using stable right-hand Taluk and District anchors."""
+    parts = [re.sub(r"\s+", " ", part).strip(" \t\r\n.,") for part in (address or "").split(",")]
+    parts = [part for part in parts if part]
+    taluk_index = next((i for i, part in enumerate(parts) if re.search(r"\btaluk\b", part, re.I)), -1)
+    taluk = town = district = ""
+    town_index = -1
+    if taluk_index >= 0:
+        match = re.search(r"^(.+?)\s+taluk\b", parts[taluk_index], re.I)
+        taluk = match.group(1).strip(" ,.") if match else re.sub(r"\s*taluk\b.*$", "", parts[taluk_index], flags=re.I).strip(" ,.")
+        if taluk_index > 0:
+            town_index = taluk_index - 1
+            town = parts[town_index]
+        for part in parts[taluk_index + 1:]:
+            if re.search(r"\bTamil\s*Nadu\b", part, re.I) or re.fullmatch(r"\d{6}", part):
+                continue
+            district = part
+            break
+
+    prefix = parts[:town_index] if town_index >= 0 else []
+    street_parts = prefix[-1:] if prefix else []
+    door_parts = prefix[:-1] if prefix else []
+    # Numeric plot/door identifiers anchor the left edge. The live Street
+    # dropdown will determine the exact end of Street for comma-separated names.
+    if len(prefix) > 1 and re.fullmatch(r"\d+[/-]\d+[A-Za-z]?(?:\s+.*)?", prefix[0]):
+        door_parts = prefix[:1]
+        street_parts = prefix[1:]
+
+    return {
+        "parts": parts,
+        "taluk_index": taluk_index,
+        "town_index": town_index,
+        "prefix_parts": prefix,
+        "taluk": taluk,
+        "district": district,
+        "town": town,
+        "street": ", ".join(street_parts),
+        "door_number": ", ".join(door_parts),
+    }
+
+
 def extract_certificate(text: str, tables=None) -> dict[str, str]:
     """Best-effort extraction. Never invent a value; unresolved fields stay blank."""
+    # Keep the CV number paired with the Date immediately following it in the
+    # certificate header, so a later machine-table date cannot be mistaken
+    # for the previous CV date.
+    cv_header = re.search(
+        r"CV\s*No\.?\s*:\s*([A-Z0-9/.-]+)\s+Date\s*:\s*(\d{2}[-/]\d{2}[-/]\d{4})\b",
+        text,
+        re.I,
+    )
     values = {
-        "Previous CV number": first(r"CV\s*No\.?\s*:\s*([^\n]+)", text),
-        "Previous CV date": first(r"Date\s*:\s*([^\n]+)", text),
+        "Previous CV number": _clean_cell(cv_header.group(1)) if cv_header else first(r"CV\s*No\.?\s*:\s*([^\n]+)", text),
+        "Previous CV date": cv_header.group(2).replace("/", "-") if cv_header else first(r"Date\s*:\s*([^\n]+)", text),
         "Applicant / establishment name": first(r"belonging to\s+M/S\s+(.+?)(?:,\s*Locality|\n)", text),
         "Instrument description": first(r"((?:Non-)?Automatic\s+.+?Class\s+(?:III|II|IV))\s*(?:\(|\n)", text),
         "Instrument make": first(r"Make\s*:\s*([^\n]+?)(?:\s+Max\s*:|\s+Model\s*:|\s+Machine\s+No\.?\s*:|\n)", text),
@@ -345,6 +396,7 @@ def extract_certificate(text: str, tables=None) -> dict[str, str]:
         "Class": first(r"Class\s+(III|IIII|II|I)\b", text),
         "Quantity": first(r"(?:\n|Items\s+)\s*(?:\d+\s+)?(\d{1,3})\s+\d+(?:\s*[a-zA-Z]+)?\s+-", text),
         "Repairer name": first(r"Repaired by\s+(.+?)(?:,\s*\d|\n)", text),
+        "Repairer mobile": first(r"Repaired by\s+.+?,\s*(\d{10})\b", text),
         "Repairer licence number": first(r"Licence Number\s*:\s*([^\n.]+)", text),
         "Stamping office/site": first(r"Stamping\s+at\s+(Office|Site)", text),
     }
@@ -352,17 +404,13 @@ def extract_certificate(text: str, tables=None) -> dict[str, str]:
     raw_address = first(r"Locality\s+(.+?)(?=\s+Items\s+Quant|$)", text)
     values["Business address"] = raw_address
     values["State"] = "Tamil Nadu" if re.search(r"Tamil\s*Nadu", text, re.I) else ""
-    parts = [p.strip() for p in raw_address.split(",") if p.strip()]
-    taluk_at = next((i for i, part in enumerate(parts) if re.search(r"\btaluk\b", part, re.I)), -1)
-    values["Taluk"] = re.sub(r"\s*taluk\s*", "", parts[taluk_at], flags=re.I).strip() if taluk_at >= 0 else ""
-    values["District"] = parts[taluk_at + 1] if taluk_at >= 0 and len(parts) > taluk_at + 1 else ""
-    values["Town / Village"] = parts[taluk_at - 1] if taluk_at > 0 else ""
-    values["Street"] = parts[taluk_at - 2] if taluk_at > 2 else ""
-    values["Door number"] = ", ".join(parts[:taluk_at - 2]) if taluk_at > 2 else ""
+    location = _locality_components(raw_address)
+    values["Taluk"] = location["taluk"]
+    values["District"] = location["district"]
+    values["Town / Village"] = location["town"]
+    values["Street"] = location["street"]
+    values["Door number"] = location["door_number"]
     values["Pincode"] = first(r"\b(\d{6})\b", raw_address)
-    if not values["Street"]:
-        street_candidates = [p for p in parts[1:taluk_at - 1] if re.search(r"road|street|salai|main", p, re.I)] if taluk_at > 1 else []
-        values["Street"] = street_candidates[-1] if street_candidates else ""
     values["Repairer licence date"] = first(r"Licence Number\s*:\s*[^\n]*?(\d{2}[-/]\d{2}[-/]\d{4})", text)
     values["Repairer business name"] = first(r"Repaired by\s+(.+?)(?:,\s*\d|\n)", text)
     values["Trader / establishment number"] = first(r"Trader\s+No\.?\s*:\s*\n\s*([^\n]+)", text)
@@ -380,6 +428,7 @@ class PortalWorker(threading.Thread):
         self.ready = threading.Event()
         self.pending_application = None
         self.ready_for_submit = False
+        self.final_edit_retry_used = False
         self.workflow_step = 0
         self.waiting_for_login = False
         self.login_attempt_at = 0.0
@@ -396,12 +445,22 @@ class PortalWorker(threading.Thread):
             return
         with sync_playwright() as pw:
             try:
-                browser = pw.chromium.launch(headless=False)
+                # One-file Windows builds can need several seconds to extract
+                # the bundled browser on first launch. Keep startup generous;
+                # the UI queues its command while this worker initializes.
+                browser = pw.chromium.launch(
+                    headless=False,
+                    timeout=60000,
+                    args=["--start-maximized"],
+                )
             except Exception as e:
                 self.ready.set()
                 self.messages.put(("error", f"Could not start the app's Chromium browser. Rebuild the app with the bundled browser.\n{e}"))
                 return
-            context = browser.new_context()
+            # Use Chromium's actual window dimensions as the page viewport.
+            # This makes the portal reflow when maximized or restored to a
+            # smaller window instead of keeping a fixed 1280x720 canvas.
+            context = browser.new_context(no_viewport=True)
             self.page = context.new_page()
             self.page.set_default_timeout(9000)
             self.page.set_default_navigation_timeout(20000)
@@ -433,12 +492,14 @@ class PortalWorker(threading.Thread):
                             self.messages.put(("details", report))
                             if report["required_blank"]:
                                 missing = "; ".join(report["required_blank"][:16])
-                                self.messages.put(("error", f"The portal page is still incomplete. Missing or unconfirmed: {missing}. Complete those fields in the app browser; the application was not submitted."))
+                                reasons = "; ".join(report.get("skipped", [])[:12])
+                                detail = f" Automation details: {reasons}." if reasons else ""
+                                self.messages.put(("error", f"The portal page is still incomplete. Missing or unconfirmed: {missing}.{detail} Complete those fields in the app browser; the application was not submitted."))
                             elif not report.get("final_submit_visible"):
                                 self.messages.put(("error", "The portal did not reach a page with a visible Submit control. Review the fields reported as skipped, then use Fill now / retry; nothing was submitted."))
                             else:
                                 self.ready_for_submit = True
-                                self.messages.put(("ready_to_submit", "The application pages are filled through the final review page. Review them in the app browser, then use Submit to complete the application."))
+                                self._submit()
                         except Exception as e:
                             self.messages.put(("error", f"Login was detected, but the automatic form steps stopped safely: {e}"))
                     continue
@@ -450,6 +511,7 @@ class PortalWorker(threading.Thread):
                         self.waiting_for_login = True
                         self.ready_for_submit = False
                         self.workflow_step = 0
+                        self.final_edit_retry_used = False
                         self._open_login_page()
                         self._fill_login(payload["credentials"])
                         self.messages.put(("opened", "Portal opened in bundled Chromium and saved sign-in filled. Enter the CAPTCHA there; the application will continue automatically if a PDF draft is ready."))
@@ -465,12 +527,14 @@ class PortalWorker(threading.Thread):
                             self.messages.put(("details", report))
                             if report["required_blank"]:
                                 missing = "; ".join(report["required_blank"][:16])
-                                self.messages.put(("error", f"The portal page is still incomplete. Missing or unconfirmed: {missing}. Complete those fields in the app browser; the application was not submitted."))
+                                reasons = "; ".join(report.get("skipped", [])[:12])
+                                detail = f" Automation details: {reasons}." if reasons else ""
+                                self.messages.put(("error", f"The portal page is still incomplete. Missing or unconfirmed: {missing}.{detail} Complete those fields in the app browser; the application was not submitted."))
                             elif not report.get("final_submit_visible"):
                                 self.messages.put(("error", "The portal did not reach a page with a visible Submit control. Review the fields reported as skipped, then use Fill now / retry; nothing was submitted."))
                             else:
                                 self.ready_for_submit = True
-                                self.messages.put(("ready_to_submit", "The application pages are filled through the final review page. Review them in the app browser, then use Submit to complete the application."))
+                                self._submit()
                     elif cmd == "submit":
                         self._submit()
                     elif cmd == "credentials":
@@ -516,12 +580,13 @@ class PortalWorker(threading.Thread):
             previous_url = current_url
 
     def send(self, cmd: str, payload=None):
-        if not self.is_alive():
+        # Never block the Tk UI waiting for Chromium. Queue the first command
+        # immediately; the worker consumes it once Playwright and the browser
+        # are ready, or posts a copyable startup error if they fail.
+        if self.ident is None:
             self.start()
-            if not self.ready.wait(8):
-                raise RuntimeError("Browser automation could not start.")
-            if not self.is_alive():
-                raise RuntimeError("Browser automation exited before Chromium became ready. Check the error shown in the app.")
+        elif not self.is_alive():
+            raise RuntimeError("The Chromium worker stopped. Close and reopen the app, then retry.")
         self.commands.put((cmd, payload))
 
     def _login_controls(self):
@@ -699,6 +764,14 @@ class PortalWorker(threading.Thread):
         if not self._logged_in():
             raise RuntimeError("Login is not detected yet. Complete the CAPTCHA and click Login in the app browser.")
         if page.locator("#Stamping").count() and page.locator("#Stamping").first.is_visible():
+            # The portal often renders its form shell before the fields become
+            # available. Wait for the first actual control before building the
+            # fill queue; otherwise every dependent field can be misreported as
+            # absent even though the page is still loading.
+            try:
+                page.locator("#newgood:visible").wait_for(state="visible", timeout=20000)
+            except Exception:
+                pass
             return
         section = page.get_by_text(re.compile(r"The Legal Metrology Act,\s*2009.*Verification and Stamping", re.I))
         self._click_if_visible(section)
@@ -753,15 +826,32 @@ class PortalWorker(threading.Thread):
         """Resolve unassociated Bootstrap labels by their nearest following control."""
         root = scope or self.page
         try:
-            label_top = float(label.evaluate("el => el.getBoundingClientRect().top"))
+            label_box = label.evaluate("el => { const r=el.getBoundingClientRect(); return {top:r.top,bottom:r.bottom,left:r.left,right:r.right}; }")
+            # Prefer the label's own form-group/column so a neighboring select
+            # in the same visual row cannot be mistaken for a text input.
+            for depth in range(1, 7):
+                ancestor = label.locator("xpath=" + "/".join([".."] * depth))
+                controls = ancestor.locator(selector)
+                local = []
+                for control in controls.all():
+                    if not control.is_visible():
+                        continue
+                    box = control.evaluate("el => { const r=el.getBoundingClientRect(); return {top:r.top,left:r.left,right:r.right}; }")
+                    vertical = box["top"] - label_box["bottom"]
+                    horizontal = max(0, label_box["left"] - box["right"], box["left"] - label_box["right"])
+                    if -8 <= vertical <= 100 and horizontal <= 100:
+                        local.append((abs(vertical) + horizontal * 2, control))
+                if local:
+                    return min(local, key=lambda item: item[0])[1]
             candidates = []
             for control in root.locator(selector).all():
                 if not control.is_visible():
                     continue
-                top = float(control.evaluate("el => el.getBoundingClientRect().top"))
-                gap = top - label_top
-                if -4 <= gap <= 125:
-                    candidates.append((abs(gap), control))
+                box = control.evaluate("el => { const r=el.getBoundingClientRect(); return {top:r.top,left:r.left,right:r.right}; }")
+                vertical = box["top"] - label_box["bottom"]
+                horizontal = max(0, label_box["left"] - box["right"], box["left"] - label_box["right"])
+                if -8 <= vertical <= 100 and horizontal <= 100:
+                    candidates.append((abs(vertical) + horizontal * 2, control))
             return min(candidates, key=lambda item: item[0])[1] if candidates else None
         except Exception:
             return None
@@ -786,13 +876,41 @@ class PortalWorker(threading.Thread):
                     pass
         return self._field_for(FIELD_LABELS.get(field, [field]))
 
-    def _field_in_section(self, heading_pattern, label_pattern):
+    def _field_in_section(self, heading_pattern, label_pattern, expected_tag=None):
         scope = self._section_locator(heading_pattern)
+        def accepted(control):
+            if control is None:
+                return False
+            if expected_tag:
+                try:
+                    return control.evaluate("el => el.tagName.toLowerCase()") == expected_tag
+                except Exception:
+                    return False
+            return True
         try:
-            heading = self.page.get_by_text(re.compile(heading_pattern, re.I)).first
-            heading_top = float(heading.evaluate("el => el.getBoundingClientRect().top")) if heading.count() else float("-inf")
+            heading_tops = []
+            for heading in self._section_headings(heading_pattern):
+                try:
+                    heading_tops.append(float(heading.evaluate("el => el.getBoundingClientRect().top")))
+                except Exception:
+                    continue
+            heading_top = min(heading_tops) if heading_tops else float("-inf")
             candidates = []
-            for label in scope.locator("label,.control-label,[class*=label]").all():
+            # Accessible labels are more reliable than assuming the portal
+            # nests each label beside its control in a particular Bootstrap
+            # layout. Restrict the result by the selected section's position
+            # so duplicate address labels resolve to the correct block.
+            try:
+                for control in self.page.get_by_label(re.compile(label_pattern, re.I)).all():
+                    if control.is_visible() and accepted(control):
+                        top = float(control.evaluate("el => el.getBoundingClientRect().top"))
+                        if top >= heading_top:
+                            candidates.append((top, control))
+            except Exception:
+                pass
+            if candidates:
+                return min(candidates, key=lambda item: item[0])[1]
+            for label in self.page.locator("label,.control-label,[class*=label]").all():
                 if not label.is_visible():
                     continue
                 label_text = self._norm(label.inner_text())
@@ -807,15 +925,16 @@ class PortalWorker(threading.Thread):
                 target_id = label.get_attribute("for")
                 if target_id:
                     control = self.page.locator(f"#{target_id}")
-                    if control.count() and control.first.is_visible():
+                    if control.count() and control.first.is_visible() and accepted(control.first):
                         candidates.append((label_top, control.first))
                         continue
-                nested = label.locator("input,select,textarea").first
-                if nested.count() and nested.is_visible():
+                selector = f"{expected_tag}:not([type='hidden'])" if expected_tag else "input,select,textarea"
+                nested = label.locator(selector).first
+                if nested.count() and nested.is_visible() and accepted(nested):
                     candidates.append((label_top, nested))
                     continue
-                nearby = self._control_near_label(label, scope)
-                if nearby is not None:
+                nearby = self._control_near_label(label, self.page, selector)
+                if nearby is not None and accepted(nearby):
                     candidates.append((label_top, nearby))
             if candidates:
                 return min(candidates, key=lambda item: item[0])[1]
@@ -840,8 +959,13 @@ class PortalWorker(threading.Thread):
         return bool(actual) and compact(actual) == compact(expected)
 
     def _fill_form(self, payload):
-        self._navigate_to_stamping_form()
+        if self.workflow_step < 2:
+            self._navigate_to_stamping_form()
+        elif not self._logged_in():
+            raise RuntimeError("The portal session is no longer signed in. Log in again before continuing the machine details review.")
         self.ready_for_submit = False
+        if self.workflow_step <= 0:
+            self.final_edit_retry_used = False
         report = {"filled": [], "skipped": [], "uploaded": [], "required_blank": []}
         fields = payload["fields"]
         machines = payload.get("machine_rows") or [fields]
@@ -852,7 +976,20 @@ class PortalWorker(threading.Thread):
         if self.workflow_step <= 1:
             # Items and Previous Information are lower sections on this same
             # first portal page. Fill them before validating or clicking Next.
-            self._fill_items_and_previous_information(groups, machines, report["skipped"], report["filled"])
+            self._fill_items_and_previous_information(
+                groups, machines, report["skipped"], report["filled"],
+                fallback_application_number=fields.get("Application number", ""),
+            )
+            company_name = fields.get("Applicant / establishment name", "").strip()
+            manufacturer_name_marker = "Manufacturer / Trader establishment name"
+            if company_name and not self._ensure_manufacturer_company_name(company_name):
+                report["filled"] = [item for item in report["filled"] if item != manufacturer_name_marker]
+                report["skipped"].append(
+                    f"{manufacturer_name_marker} changed while filling the first page and could not be restored to {company_name}"
+                )
+                missing_marker = "Portal field not filled: Manufacturer / Trader establishment name"
+                if missing_marker not in report["required_blank"]:
+                    report["required_blank"].append(missing_marker)
             filled_items = set(report["filled"])
             for index, _group in enumerate(groups, 1):
                 if f"Item category {index}" not in filled_items:
@@ -876,14 +1013,131 @@ class PortalWorker(threading.Thread):
 
         if self.workflow_step <= 2:
             self._fill_machine_detail_tables(groups, machines, report["skipped"], report["filled"])
+            filled_machine_cvs = {
+                item for item in report["filled"]
+                if re.fullmatch(r"Machine \d+ Previous CV number", item)
+            }
+            for index, machine in enumerate(machines, 1):
+                expected_cv = str(machine.get("Previous CV number", "")).strip()
+                marker = f"Machine {index} Previous CV number"
+                if expected_cv and marker not in filled_machine_cvs:
+                    report["required_blank"].append(
+                        f"Previous CV dropdown for machine {index} was not confirmed as {expected_cv}"
+                    )
             self._collect_visible_required(report)
             if report["required_blank"]:
                 return report
             self._click_next("final application page")
             self.workflow_step = 3
+        if self.workflow_step >= 3:
+            final_issue_start = len(report["required_blank"])
+            self._verify_final_review_cvs(machines, report["required_blank"])
+            machine_review_issues = report["required_blank"][final_issue_start:]
+            if machine_review_issues and not self.final_edit_retry_used:
+                edit = self._find_visible_edit()
+                if edit is not None:
+                    self.final_edit_retry_used = True
+                    previous_signature = self._visible_form_signature()
+                    edit.click(timeout=10000)
+                    try:
+                        self.page.wait_for_load_state("domcontentloaded", timeout=12000)
+                    except Exception:
+                        pass
+                    deadline = time.monotonic() + 12
+                    while time.monotonic() < deadline:
+                        self.page.wait_for_timeout(250)
+                        if self._visible_form_signature() != previous_signature:
+                            break
+                    self.workflow_step = 2
+                    retry_report = self._fill_form(payload)
+                    retry_report["skipped"].insert(
+                        0, "Final machine review failed once; the portal Edit control was used to refill page 2 and review again"
+                    )
+                    return retry_report
+                report["required_blank"].append(
+                    "Final machine details need correction, but the portal Edit control was not available"
+                )
+            self._verify_final_review_total(machines, report["required_blank"])
         self._collect_visible_required(report)
         report["final_submit_visible"] = self._find_visible_submit() is not None
         return report
+
+    def _verify_final_review_total(self, machines, required_blank):
+        expected_total = sum(_item_count(row.get("Quantity", "")) for row in machines)
+        if not expected_total:
+            return
+        try:
+            summaries = self.page.locator("table").all()
+            for table in summaries:
+                if "total opted quantity" not in self._norm(table.inner_text()):
+                    continue
+                header_cells = []
+                for row in table.locator("tr").all():
+                    cells = row.locator("th,td").all()
+                    labels = [self._norm(cell.inner_text()) for cell in cells]
+                    if "total quantity" in labels:
+                        header_cells = labels
+                        continue
+                    if not header_cells or len(cells) != len(header_cells):
+                        continue
+                    quantity_index = header_cells.index("total quantity")
+                    actual = re.sub(r"\D", "", cells[quantity_index].inner_text())
+                    if actual and int(actual) == expected_total:
+                        return
+                    if actual:
+                        required_blank.append(
+                            f"Final review total quantity is {actual}; expected {expected_total}"
+                        )
+                        return
+            required_blank.append("Final review did not show the expected total quantity summary")
+        except Exception as exc:
+            required_blank.append(f"Final review total quantity could not be confirmed: {exc}")
+
+    def _verify_final_review_cvs(self, machines, required_blank):
+        """Confirm the final review table retains each machine's own CV reference."""
+        try:
+            rows = [
+                re.sub(r"\s+", " ", row.inner_text()).strip()
+                for row in self.page.locator("table tr").all()
+            ]
+        except Exception:
+            rows = []
+        normalized_rows = [self._norm(row) for row in rows]
+        for index, machine in enumerate(machines, 1):
+            cv_number = str(machine.get("Previous CV number", "")).strip()
+            if not cv_number:
+                continue
+            machine_number = str(machine.get("Machine number", "")).strip()
+            cv_norm = self._norm(cv_number)
+            machine_norm = self._norm(machine_number)
+            matched_row = next((row for row in normalized_rows
+                                if cv_norm in row and (not machine_norm or machine_norm in row)), None)
+            if matched_row is None:
+                required_blank.append(
+                    f"Final review did not confirm CV {cv_number} for machine {index}"
+                )
+                continue
+
+            # Confirm the final table retained the machine values parsed from
+            # its certificate, not just a CV number that could belong to a
+            # different row. Quantity is aggregated by item type, so it is
+            # checked on the item summary instead of per-machine rows.
+            detail_fields = (
+                ("Denomination", "Weights"), ("Class",),
+                ("Maximum capacity",), ("Minimum capacity",),
+                ("Verification interval (e/d)",), ("Instrument make",),
+                ("Instrument model",), ("Machine number",),
+            )
+            for aliases in detail_fields:
+                expected = next((str(machine.get(key, "")).strip() for key in aliases
+                                 if str(machine.get(key, "")).strip()), "")
+                if not expected:
+                    continue
+                expected_norm = re.sub(r"[^a-z0-9]+", "", expected.lower())
+                if expected_norm and expected_norm not in re.sub(r"[^a-z0-9]+", "", matched_row):
+                    required_blank.append(
+                        f"Final review machine {index} did not confirm {aliases[0]}: {expected}"
+                    )
 
     @staticmethod
     def _group_items(machines):
@@ -898,19 +1152,120 @@ class PortalWorker(threading.Thread):
             group["machines"].append(row)
         return list(groups.values())
 
+    def _save_address_option_snapshot(self, section_pattern, field, locator):
+        """Persist authoritative dropdown options observed in the live portal."""
+        field = str(field or "").removeprefix("Manufacturer ").strip()
+        hierarchy = ["State", "District", "Taluk", "Town / Village", "Street"]
+        if field not in hierarchy or locator is None:
+            return
+        try:
+            options = []
+            for option in locator.locator("option").all():
+                label = re.sub(r"\s+", " ", option.inner_text()).strip()
+                value = str(option.evaluate("el => el.value") or "")
+                if (not label or not value or self._norm(label) in {"select", "please select"}
+                        or option.evaluate("el => el.disabled")):
+                    continue
+                options.append({"label": label, "value": str(value)})
+            if not options:
+                return
+
+            parents = {}
+            for parent_field in hierarchy[:hierarchy.index(field)]:
+                pattern = {
+                    "State": r"^state$", "District": r"^district$",
+                    "Taluk": r"^taluk$", "Town / Village": r"^town\s*/?\s*village$",
+                }[parent_field]
+                parent = self._field_in_section(section_pattern, pattern)
+                if parent is None or not parent.count():
+                    continue
+                try:
+                    selected = parent.locator("option:checked").first
+                    parents[parent_field] = {
+                        "label": re.sub(r"\s+", " ", selected.inner_text()).strip(),
+                        "value": str(parent.input_value()),
+                    }
+                except Exception:
+                    continue
+
+            block = "manufacturer" if re.search(r"manufacturer", section_pattern, re.I) else "establishment"
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            key = json.dumps([block, field, parents], ensure_ascii=False, sort_keys=True)
+            record = {
+                "key": key,
+                "section": block,
+                "field": field,
+                "parents": parents,
+                "options": options,
+                "captured_at": stamp,
+                "source": "live Tamil Nadu Labour Department stamping form",
+            }
+
+            exe_dir = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+            candidate_dirs = [exe_dir / "address_comparison", APP_DIR / "address_comparison", FALLBACK_APP_DIR / "address_comparison"]
+            with ADDRESS_CACHE_LOCK:
+                target = None
+                for directory in candidate_dirs:
+                    try:
+                        directory.mkdir(parents=True, exist_ok=True)
+                        target = directory / "location_options.json"
+                        break
+                    except Exception:
+                        continue
+                if target is None:
+                    return
+                data = {"schema_version": 1, "portal": STAMPING_URL, "snapshots": []}
+                if target.exists():
+                    try:
+                        with target.open("r", encoding="utf-8") as stream:
+                            loaded = json.load(stream)
+                        if isinstance(loaded, dict):
+                            data.update(loaded)
+                    except Exception:
+                        pass
+                snapshots = data.setdefault("snapshots", [])
+                existing_index = next((i for i, item in enumerate(snapshots) if item.get("key") == key), None)
+                if existing_index is not None and snapshots[existing_index].get("options") == options:
+                    return
+                if existing_index is None:
+                    snapshots.append(record)
+                else:
+                    snapshots[existing_index] = record
+                data["updated_at"] = stamp
+                temporary = target.with_suffix(".tmp")
+                with temporary.open("w", encoding="utf-8", newline="\n") as stream:
+                    json.dump(data, stream, ensure_ascii=False, indent=2)
+                temporary.replace(target)
+        except Exception:
+            # Address snapshots are a local aid; they must never interrupt a
+            # portal application if the directory is unavailable.
+            return
+
     def _fill_establishment_page(self, fields, machines, payload, report):
         page = self.page
-        # Order first-page inputs, choices, and uploads by visible position.
-        machine_kinds = {
-            "Electronic" if "electronic" in row.get("Instrument description", "").lower()
-            else "Mechanical" if "mechanical" in row.get("Instrument description", "").lower()
-            else "Other"
-            for row in machines if row.get("Instrument description")
+        page_stamping_modes = {
+            normalize_text(row.get("Stamping office/site", ""))
+            for row in machines
+            if str(row.get("Stamping office/site", "")).strip()
         }
-        new_goods_choice = next(iter(machine_kinds)) if len(machine_kinds) == 1 else "Other"
+        if len(page_stamping_modes) == 1:
+            mode = next(iter(page_stamping_modes))
+            fields["Stamping office/site"] = "Site" if mode == "site" else "Office" if mode == "office" else fields.get("Stamping office/site", "")
+        elif len(page_stamping_modes) > 1:
+            labels = ", ".join(sorted(mode.title() for mode in page_stamping_modes))
+            fields["Stamping office/site"] = ""
+            report["skipped"].append(f"Stamping office/site (PDF pages have conflicting labels: {labels})")
+
+        # Order first-page inputs, choices, and uploads by visible position.
+        machine_descriptions = [str(row.get("Instrument description", "")).strip().lower() for row in machines]
+        all_electronic = bool(machine_descriptions) and all("electronic" in description for description in machine_descriptions)
+        new_goods_choice = "Electronic weighing machine" if all_electronic else "Others"
         new_goods = page.locator("#newgood")
-        electronic_max = max((self._capacity_kg(row.get("Maximum capacity", "")) for row in machines if "electronic" in row.get("Instrument description", "").lower()), default=0)
-        capacity_choice = "Above 3 tonnes" if electronic_max > 3000 else "Below 3 tonnes"
+        denomination_kg = [
+            self._capacity_kg(str(row.get("Weights") or row.get("Denomination") or ""))
+            for row in machines
+        ]
+        capacity_choice = "Above 3 tonnes" if any(weight >= 3000 for weight in denomination_kg) else "Below 3 tonnes"
         actions = []
         establishment_labels = {
             "Applicant / establishment name": r"name",
@@ -923,20 +1278,138 @@ class PortalWorker(threading.Thread):
             "Pincode": r"pincode|pin\s+code",
         }
         excluded = set(LOCAL_ONLY_FIELDS) | {"Applicant business name", "Applicant contact name", "Used by / trader contact", "Trader / establishment number"}
+        deferred_actions = []
+
+        def wait_for_location_option(locator, value, timeout=10):
+            target = self._norm(value)
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                try:
+                    for option in locator.locator("option").all():
+                        label = self._norm(option.inner_text())
+                        option_value = str(option.evaluate("el => el.value") or "")
+                        explicitly_empty = option.get_attribute("value") == ""
+                        if (label == target and option_value and not explicitly_empty
+                                and not option.evaluate("el => el.disabled")):
+                            return True
+                except Exception:
+                    pass
+                page.wait_for_timeout(100)
+            return False
+
+        def location_option_signature(locator):
+            """Return the enabled option list so cascading selects can be observed settling."""
+            try:
+                control = locator.first if hasattr(locator, "first") else locator
+                return tuple(
+                    (self._norm(option.inner_text()), str(option.evaluate("el => el.value") or ""))
+                    for option in control.locator("option").all()
+                    if not option.evaluate("el => el.disabled")
+                )
+            except Exception:
+                return ()
+
+        def wait_for_dependent_option(locator, value, previous_signature, require_refresh, timeout=20):
+            """Wait for the dependent select to refresh, contain the target, and settle."""
+            deadline = time.monotonic() + timeout
+            last_signature = None
+            stable_since = None
+            while time.monotonic() < deadline:
+                signature = location_option_signature(locator)
+                has_target = any(
+                    label == self._norm(value) and option_value
+                    for label, option_value in signature
+                )
+                refreshed = not require_refresh or signature != previous_signature
+                if has_target and refreshed:
+                    if signature != last_signature:
+                        last_signature = signature
+                        stable_since = time.monotonic()
+                    elif stable_since is not None and time.monotonic() - stable_since >= 0.35:
+                        return True
+                else:
+                    stable_since = None
+                    last_signature = signature
+                page.wait_for_timeout(100)
+            return False
+
+        def wait_for_location_list(locator, timeout=10):
+            """Wait until a dependent address select has populated and settled."""
+            deadline = time.monotonic() + timeout
+            last_signature = None
+            stable_since = None
+            while time.monotonic() < deadline:
+                try:
+                    if locator is None or not locator.count() or not locator.first.is_visible():
+                        page.wait_for_timeout(100)
+                        continue
+                    control = locator.first
+                    if not control.is_enabled():
+                        page.wait_for_timeout(100)
+                        continue
+                    signature = tuple(
+                        (self._norm(option.inner_text()), option.evaluate("el => el.value"))
+                        for option in control.locator("option").all()
+                        if not option.evaluate("el => el.disabled")
+                    )
+                    useful = [
+                        label for label, value in signature
+                        if label and value and label not in {"select", "please select"}
+                    ]
+                    if useful:
+                        if signature != last_signature:
+                            last_signature = signature
+                            stable_since = time.monotonic()
+                        elif stable_since is not None and time.monotonic() - stable_since >= 0.3:
+                            return True
+                except Exception:
+                    pass
+                page.wait_for_timeout(100)
+            return False
+
+        def selected_option_label(locator):
+            try:
+                return self._norm(locator.locator("option:checked").first.inner_text())
+            except Exception:
+                return ""
+
+        def control_matches_value(locator, value):
+            try:
+                if locator.evaluate("el => el.tagName.toLowerCase()") == "select":
+                    actual = selected_option_label(locator)
+                    expected = self._norm(value)
+                    return bool(actual) and (actual == expected or expected in actual or actual in expected)
+                return self._field_value_matches(locator, value)
+            except Exception:
+                return False
+
+        def establishment_control(field, section_pattern=r"Establishment\s+Details"):
+            locator = None if field == "Applicant / establishment name" else self._portal_field(field)
+            if field in establishment_labels and (locator is None or field == "Applicant / establishment name"):
+                expected_tag = "input" if field in {"Applicant / establishment name", "Door number", "Pincode"} else None
+                locator = self._field_in_section(section_pattern, establishment_labels[field], expected_tag)
+            return locator
+
         for field, value in fields.items():
             if not value or field in excluded:
                 continue
             # "Name" appears in several portal sections. Resolve the applicant
             # name only inside Establishment Details, never by a page-wide ID.
-            locator = None if field == "Applicant / establishment name" else self._portal_field(field)
-            if (locator is None or field == "Applicant / establishment name") and field in establishment_labels:
-                locator = self._field_in_section(r"Establishment\s+Details", establishment_labels[field])
+            locator = establishment_control(field)
             try:
                 if locator is None or not locator.count() or not locator.first.is_visible():
-                    report["skipped"].append(f"{field} (control not found or not visible)")
+                    # Some controls are inserted only after the preceding
+                    # stamping choices are made. Re-resolve them after the
+                    # top-to-bottom pass rather than permanently skipping them.
+                    deferred_actions.append((field, None, value))
                     continue
-                if not locator.first.is_editable():
-                    report["skipped"].append(f"{field} (read-only; populated by the portal)")
+                # Dependent controls (licence number, address dropdowns and
+                # invoice fields) can be disabled until earlier choices load.
+                # Keep them in the top-to-bottom queue and recheck at fill time.
+                portal_populates = {"Registered name", "Registered email", "Registered mobile",
+                                    "Repairer licence date", "Licensed valid Up To"}
+                if not locator.first.is_editable() and field in portal_populates:
+                    deferred_actions.append((field, locator.first, value))
                     continue
                 top = locator.first.evaluate("el => el.getBoundingClientRect().top")
                 actions.append((float(top), field, locator.first, value, "field"))
@@ -963,27 +1436,66 @@ class PortalWorker(threading.Thread):
 
         applicant_name = fields.get("Applicant / establishment name", "")
         manufacturer_scope = self._section_locator(r"Manufacturer\s*/\s*Trader\s*/\s*Establishment")
-        establishment_controls = page.locator("#trader-est-name:visible").all()
-        if not establishment_controls:
-            establishment_controls = [control for control in self._controls_matching(manufacturer_scope, r"establishment\s*name")
-                                      if (control.get_attribute("id") or "").lower() != "establishmentname"]
-        if applicant_name and establishment_controls:
-            control = establishment_controls[0]
+        manufacturer_establishment_name = self._field_in_section(
+            r"Manufacturer\s*/\s*Trader\s*/\s*Establishment", r"establishment\s*name"
+        )
+        if applicant_name and manufacturer_establishment_name is not None:
+            control = manufacturer_establishment_name
             try:
                 actions.append((float(control.evaluate("el => el.getBoundingClientRect().top")), "Manufacturer / Trader establishment name", control, applicant_name, "field"))
             except Exception as exc:
                 report["skipped"].append(f"Manufacturer / Trader establishment name: {exc}")
         elif applicant_name:
-            report["skipped"].append("Manufacturer / Trader establishment name (control not found)")
+            deferred_actions.append(("Manufacturer / Trader establishment name", None, applicant_name))
+
+        # The certificate address belongs to both address blocks. Checking
+        # "Same Details" copies values only partially on some portal versions,
+        # so explicitly fill the second block too, after the checkbox action.
+        manufacturer_address_fields = {
+            "State": r"state",
+            "District": r"district",
+            "Taluk": r"taluk",
+            "Town / Village": r"town\s*/?\s*village",
+            "Street": r"street",
+            "Door number": r"door\s+number",
+            "Pincode": r"pincode|pin\s*code",
+        }
+        manufacturer_labels = {
+            "State": "Manufacturer State",
+            "District": "Manufacturer District",
+            "Taluk": "Manufacturer Taluk",
+            "Town / Village": "Manufacturer Town / Village",
+            "Street": "Manufacturer Street",
+            "Door number": "Manufacturer Door number",
+            "Pincode": "Manufacturer Pincode",
+        }
+        for field, pattern in manufacturer_address_fields.items():
+            value = fields.get(field, "")
+            if not value:
+                continue
+            control = self._field_in_section(
+                r"Manufacturer\s*/\s*Trader\s*/\s*Establishment", pattern,
+                "input" if field in {"Door number", "Pincode"} else None,
+            )
+            if control is None or not control.count() or not control.is_visible():
+                deferred_actions.append((manufacturer_labels[field], None, value))
+                continue
+            try:
+                actions.append((
+                    float(control.evaluate("el => el.getBoundingClientRect().top")),
+                    manufacturer_labels[field], control, value, "field",
+                ))
+            except Exception as exc:
+                report["skipped"].append(f"{manufacturer_labels[field]}: {exc}")
 
         used_by = page.locator("#trader-name")
-        if used_by.count():
+        if used_by.count() and used_by.first.is_visible():
             try:
-                actions.append((float(used_by.first.evaluate("el => el.getBoundingClientRect().top")), "Repaired by / Used by", used_by.first, "", "license-establishment"))
+                actions.append((float(used_by.first.evaluate("el => el.getBoundingClientRect().top")), "Repaired by / Used by", used_by.first, fields.get("Used by / trader contact", ""), "license-establishment"))
             except Exception as exc:
                 report["skipped"].append(f"Repaired by / Used by: {exc}")
         else:
-            report["skipped"].append("Repaired by / Used by (control not found)")
+            deferred_actions.append(("Repaired by / Used by", None, ""))
 
         special_choices = [
             ("Stamping purpose: Re-verification", "#stamping-intend", "Re-verification"),
@@ -1036,23 +1548,162 @@ class PortalWorker(threading.Thread):
             "Town / Village", "Street", "Door number", "Pincode",
             "Same Details for Manufacturer / Trader / Establishment",
             "Manufacturer / Trader establishment name", "Repaired by / Used by",
+            "Manufacturer State", "Manufacturer District", "Manufacturer Taluk",
+            "Manufacturer Town / Village", "Manufacturer Street",
+            "Manufacturer Door number", "Manufacturer Pincode",
             "PAN number", "PAN date", "Upload copy of PAN card",
         ]
         order_index = {name: index for index, name in enumerate(ordered_fields)}
+        row_tops = []
+        for row_top in sorted(float(action[0]) for action in actions):
+            if not row_tops or row_top - row_tops[-1] > 14:
+                row_tops.append(row_top)
+
         def action_order(action):
-            top, name = action[0], action[1]
-            return (order_index.get(name, len(order_index)), top)
+            top, name, locator = action[0], action[1], action[2]
+            # Cluster nearby control tops into a visual row, then order that
+            # row by x. This keeps label/control alignment differences from
+            # moving a right-hand field ahead of the left cell in the same row.
+            nearest_row = min(range(len(row_tops)), key=lambda idx: abs(row_tops[idx] - float(top))) if row_tops else 0
+            row_key = nearest_row if row_tops and abs(row_tops[nearest_row] - float(top)) <= 14 else len(row_tops) + round(float(top) / 14)
+            try:
+                left = locator.evaluate("""el => {
+                    let rect = el.getBoundingClientRect();
+                    if (rect.width && rect.height) return rect.left;
+                    const label = el.id ? document.querySelector('label[for="' + CSS.escape(el.id) + '"]') : null;
+                    const host = label || el.closest('.form-group,.form-row,.row') || el.parentElement;
+                    return host ? host.getBoundingClientRect().left : Number.POSITIVE_INFINITY;
+                }""")
+                if left is not None:
+                    return (row_key, float(left), order_index.get(name, len(order_index)))
+            except Exception:
+                pass
+            return (row_key, float("inf"), order_index.get(name, len(order_index)))
+
+        def select_location(field, locator, value):
+            if field.startswith("Manufacturer "):
+                section_pattern = r"Manufacturer\s*/\s*Trader\s*/\s*Establishment"
+                base_field = field.removeprefix("Manufacturer ")
+            else:
+                section_pattern = r"Establishment\s+Details"
+                base_field = field
+            self._save_address_option_snapshot(section_pattern, field, locator)
+            if field in {"District", "Taluk", "Town / Village", "Street",
+                         "Manufacturer District", "Manufacturer Taluk",
+                         "Manufacturer Town / Village", "Manufacturer Street"} and \
+                    selected_option_label(locator) != self._norm(value):
+                # Each dependent select is populated by the preceding choice.
+                # An enabled select can still contain only its placeholder, so
+                # wait for the exact address value before attempting selection.
+                if not wait_for_location_option(locator, value, timeout=20):
+                    return False
+            if field in {"Street", "Manufacturer Street"}:
+                return self._select_exact_option(locator, value)
+            if field in {"Town / Village", "Manufacturer Town / Village"}:
+                # Check repeated town names against each town's Street options.
+                if selected_option_label(locator) == self._norm(value):
+                    street_locator = self._field_in_section(section_pattern, r"street")
+                    street_target = self._norm(fields.get("Street", ""))
+                    try:
+                        existing_streets = [
+                            self._norm(option.inner_text())
+                            for option in street_locator.locator("option").all()
+                            if option.get_attribute("value") and not option.evaluate("el => el.disabled")
+                        ] if street_locator is not None else []
+                    except Exception:
+                        existing_streets = []
+                    if street_target and any(label == street_target for label in existing_streets):
+                        return True
+            else:
+                next_field = {
+                    "State": r"district", "District": r"taluk",
+                    "Taluk": r"town\s*/?\s*village", "Town / Village": r"street",
+                }.get(base_field)
+                dependent = self._field_in_section(section_pattern, next_field) if next_field else None
+                expected_child = {
+                    "State": fields.get("District", ""),
+                    "District": fields.get("Taluk", ""),
+                    "Taluk": fields.get("Town / Village", ""),
+                    "Town / Village": fields.get("Street", ""),
+                }.get(base_field, "")
+                before_signature = location_option_signature(dependent) if dependent is not None else ()
+                current_label = selected_option_label(locator)
+                already_selected = current_label == self._norm(value)
+                if already_selected:
+                    if next_field and expected_child and dependent is not None:
+                        if not wait_for_dependent_option(dependent, expected_child, before_signature, False, timeout=20):
+                            available = self._option_label_preview(dependent)
+                            dependent_name = {
+                                r"district": "District", r"taluk": "Taluk",
+                                r"town\s*/?\s*village": "Town / Village", r"street": "Street",
+                            }.get(next_field, base_field)
+                            report["skipped"].append(
+                                f"{field} is already correct, but {dependent_name} has not loaded {expected_child}; available options: {available}"
+                            )
+                            return False
+                    self._save_address_option_snapshot(section_pattern, field, locator)
+                    return True
+                if not self._select_best(locator, value):
+                    return False
+                if next_field:
+                    # Enabled controls can still contain the old list while an
+                    # asynchronous dependent dropdown refresh is in progress. Wait
+                    # for a new settled option list after an actual parent change;
+                    # a value already selected by the portal must not be reselected,
+                    # since doing so can clear its dependent lists.
+                    if (dependent is not None and expected_child
+                            and not wait_for_dependent_option(
+                                dependent, expected_child, before_signature,
+                                require_refresh=not already_selected, timeout=20,
+                            )):
+                        available = self._option_label_preview(dependent)
+                        dependent_name = {
+                            r"district": "District", r"taluk": "Taluk",
+                            r"town\s*/?\s*village": "Town / Village", r"street": "Street",
+                        }.get(next_field, base_field)
+                        report["skipped"].append(
+                            f"{field} selected, but {dependent_name} did not load an enabled option for {expected_child}; available options: {available}"
+                        )
+                        return False
+                    if dependent is not None:
+                        next_name = {
+                            r"district": "District", r"taluk": "Taluk",
+                            r"town\s*/?\s*village": "Town / Village", r"street": "Street",
+                        }.get(next_field)
+                        if next_name:
+                            self._save_address_option_snapshot(section_pattern, next_name, dependent)
+                self._save_address_option_snapshot(section_pattern, field, locator)
+                return True
+            street_locator = self._field_in_section(section_pattern, r"street")
+            resolved = self._select_town_matching_street(
+                locator, street_locator, value, fields.get("Business address", ""), section_pattern
+            )
+            if resolved is None:
+                return False
+            fields["Street"] = resolved["street"]
+            fields["Door number"] = resolved["door_number"]
+            self._save_address_option_snapshot(section_pattern, field, locator)
+            self._save_address_option_snapshot(section_pattern, "Street", street_locator)
+            return True
+
         pending_actions = sorted(actions, key=action_order)
         while pending_actions:
             _top, field, locator, value, action_type = pending_actions.pop(0)
+            if field in {"Street", "Manufacturer Street"}:
+                value = fields.get("Street", value)
+            elif field in {"Door number", "Manufacturer Door number"}:
+                value = fields.get("Door number", value)
             try:
                 # Form entry uses fill/select/check APIs; Enter is never sent to the portal.
                 if field == "New goods / machine type choice":
                     if self._select_best(locator, value):
-                        page.wait_for_timeout(350)
                         report["filled"].append(field)
-                        if new_goods_choice == "Electronic":
+                        if new_goods_choice == "Electronic weighing machine":
                             capacity = page.locator("#tonnes")
+                            try:
+                                capacity.wait_for(state="visible", timeout=2500)
+                            except Exception:
+                                pass
                             if capacity.count() and capacity.first.is_visible():
                                 top = float(capacity.first.evaluate("el => el.getBoundingClientRect().top"))
                                 pending_actions.append((top, "Weighing machine capacity range", capacity.first, capacity_choice, "field"))
@@ -1069,10 +1720,19 @@ class PortalWorker(threading.Thread):
                     else:
                         report["skipped"].append(field)
                     continue
+                if action_type not in {"upload", "checkbox"} and control_matches_value(locator, value):
+                    # Retries are idempotent: retain confirmed entries instead
+                    # of replaying their change handlers and disturbing later
+                    # dependent fields.
+                    if field not in report["filled"]:
+                        report["filled"].append(field)
+                    continue
                 if action_type == "license-establishment":
-                    license_establishment = page.locator("#establishmentname")
-                    license_name = license_establishment.input_value().strip() if license_establishment.count() else ""
-                    value = (license_name.split(",", 1)[0].strip() if license_name else "") or fields.get("Used by / trader contact", "")
+                    value = str(value or fields.get("Used by / trader contact", "")).strip()
+                    if not value:
+                        license_establishment = page.locator("#establishmentname")
+                        license_name = license_establishment.input_value().strip() if license_establishment.count() else ""
+                        value = license_name
                     if not value:
                         report["skipped"].append("Repaired by / Used by (license establishment name unavailable)")
                         continue
@@ -1087,17 +1747,34 @@ class PortalWorker(threading.Thread):
                     else:
                         locator.set_input_files(value); report["uploaded"].append(field)
                     continue
+                deferred_fields = {"Repairer name", "Repairer licence number", "Previous CV number",
+                                   "Previous CV date", "District", "Taluk", "Town / Village", "Street",
+                                   "Manufacturer District", "Manufacturer Taluk",
+                                   "Manufacturer Town / Village", "Manufacturer Street"}
+                if field in deferred_fields and not locator.is_editable():
+                    # Wait at this field's position in the visible row order.
+                    # Dependent controls often enable as soon as the preceding
+                    # dropdown's change request completes.
+                    deadline = time.monotonic() + 6
+                    while time.monotonic() < deadline and not locator.is_editable():
+                        page.wait_for_timeout(100)
+                    if not locator.is_editable():
+                        if control_matches_value(locator, value):
+                            if field not in report["filled"]:
+                                report["filled"].append(field)
+                            continue
+                        deferred_actions.append((field, locator, value))
+                        continue
                 if locator.evaluate("el => el.tagName.toLowerCase()") == "select":
-                    selected = self._select_best(locator, value)
-                    if not selected and field in {"District", "Taluk", "Town / Village", "Street", "Weighing machine capacity range"}:
-                        deadline = time.monotonic() + 25
-                        while time.monotonic() < deadline and not selected:
-                            page.wait_for_timeout(300)
-                            if locator.is_enabled() and locator.evaluate("el => !el.options || el.options.length > 1"):
-                                selected = self._select_best(locator, value)
+                    selected = select_location(field, locator, value)
                     if not selected:
+                        if field in {"District", "Taluk", "Town / Village", "Street", "Weighing machine capacity range"}:
+                            deferred_actions.append((field, locator, value))
+                            continue
                         report["skipped"].append(f"{field} (no matching enabled option for {value})")
                         continue
+                    if field.startswith("Manufacturer ") and applicant_name:
+                        self._ensure_manufacturer_company_name(applicant_name, stable_for=0.1)
                 elif not self._fill_control(locator, value):
                     report["skipped"].append(f"{field} (could not select {value})")
                     continue
@@ -1105,29 +1782,151 @@ class PortalWorker(threading.Thread):
                 # been selected. Resolve it then, before moving further down.
                 if field == "Stamping office/site" and str(value).lower() == "site":
                     dormant = None
-                    deadline = time.monotonic() + 8
+                    deadline = time.monotonic() + 4
                     while time.monotonic() < deadline and dormant is None:
                         candidate = self._field_for(["Dormant / Other", "Dormant / other", "Dormant"])
+                        if candidate is None:
+                            # Some portal revisions render an unlabelled select
+                            # for the site fee choice. Identify it from its actual
+                            # option labels instead of guessing a selector ID.
+                            for choice in page.locator("select:visible").all():
+                                try:
+                                    labels = [self._norm(option.inner_text()) for option in choice.locator("option").all()]
+                                    if any("dormant" in label for label in labels) and any("other" in label for label in labels):
+                                        candidate = choice
+                                        break
+                                except Exception:
+                                    continue
                         if candidate is not None and candidate.count() and candidate.first.is_visible():
                             dormant = candidate.first
                             break
-                        page.wait_for_timeout(250)
+                        page.wait_for_timeout(100)
                     if dormant is not None and dormant.count() and dormant.first.is_visible():
                         dormant_top = float(dormant.first.evaluate("el => el.getBoundingClientRect().top"))
                         pending_actions.append((dormant_top, "Site Dormant / Other choice", dormant.first, fields.get("Dormant / Other", "Other"), "field"))
                         pending_actions.sort(key=action_order)
                     else:
                         report["skipped"].append("Site Dormant / Other choice (control not found after selecting Site)")
-                if field == "Repairer licence number":
-                    page.wait_for_timeout(1400)
-                elif field in {"State", "District", "Taluk", "Town / Village", "Street"}:
-                    page.wait_for_timeout(1200 if field in {"District", "Taluk"} else 700)
                 if field in {"Repairer licence number", "Previous CV number", "Previous CV date"} and not self._field_value_matches(locator, value):
                     report["skipped"].append(f"{field} (portal value did not persist after filling)")
                     continue
                 report["filled"].append(field)
             except Exception as exc:
                 report["skipped"].append(f"{field}: {exc}")
+
+        # Revisit fields that started disabled after their prerequisite choices
+        # or uploads have now been applied. This keeps the main pass top-to-bottom
+        # while still handling the portal's delayed Town/Street and licence fields.
+        def deferred_action_order(action):
+            name, locator, _value = action
+            try:
+                box = locator.bounding_box() if locator is not None else None
+                if box:
+                    return (round(box["y"] / 8), box["x"], order_index.get(name, len(order_index)))
+            except Exception:
+                pass
+            return (float("inf"), float("inf"), order_index.get(name, len(order_index)))
+
+        deferred_actions.sort(key=deferred_action_order)
+        for field, locator, value in deferred_actions:
+            if field in {"Street", "Manufacturer Street"}:
+                value = fields.get("Street", value)
+            elif field in {"Door number", "Manufacturer Door number"}:
+                value = fields.get("Door number", value)
+            try:
+                if locator is None:
+                    if field == "Manufacturer / Trader establishment name":
+                        locator = self._field_in_section(
+                            r"Manufacturer\s*/\s*Trader\s*/\s*Establishment", r"establishment\s*name"
+                        )
+                    elif field == "Repaired by / Used by":
+                        locator = page.locator("#trader-name")
+                        if not locator.count() or not locator.is_visible():
+                            locator = self._field_in_section(
+                                r"Manufacturer\s*/\s*Trader\s*/\s*Establishment", r"repaired\s*by\s*/?\s*used\s*by"
+                            )
+                        value = str(fields.get("Used by / trader contact", "")).strip()
+                        if not value:
+                            license_establishment = page.locator("#establishmentname")
+                            license_name = license_establishment.input_value().strip() if license_establishment.count() else ""
+                            value = license_name
+                    elif field.startswith("Manufacturer "):
+                        original_field = field.removeprefix("Manufacturer ")
+                        pattern = manufacturer_address_fields.get(original_field)
+                        locator = self._field_in_section(
+                            r"Manufacturer\s*/\s*Trader\s*/\s*Establishment", pattern,
+                            "input" if original_field in {"Door number", "Pincode"} else None,
+                        ) if pattern else None
+                    else:
+                        locator = establishment_control(field)
+                if locator is None or not locator.count() or not locator.is_visible():
+                    report["skipped"].append(f"{field} (control not found or not visible after prerequisite fields loaded)")
+                    continue
+                if field in {"Registered name", "Registered email", "Registered mobile",
+                             "Repairer licence date", "Licensed valid Up To"}:
+                    # These controls are read-only and populated asynchronously
+                    # after the repairer licence number is accepted. Check them
+                    # after prerequisite fields have been processed.
+                    deadline = time.monotonic() + 20
+                    while time.monotonic() < deadline:
+                        if self._field_value_matches(locator, value):
+                            if field not in report["filled"]:
+                                report["filled"].append(field)
+                            break
+                        page.wait_for_timeout(150)
+                    else:
+                        try:
+                            actual = locator.input_value().strip()
+                        except Exception:
+                            actual = ""
+                        report["skipped"].append(
+                            f"{field} (portal did not populate expected value; current value: {actual or 'blank'})"
+                        )
+                    continue
+                if control_matches_value(locator, value):
+                    if field not in report["filled"]:
+                        report["filled"].append(field)
+                    continue
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline and not locator.is_editable():
+                    page.wait_for_timeout(100)
+                if not locator.is_editable():
+                    report["skipped"].append(f"{field} (still disabled after prerequisite fields loaded)")
+                    continue
+                if control_matches_value(locator, value):
+                    if field not in report["filled"]:
+                        report["filled"].append(field)
+                    continue
+                if locator.evaluate("el => el.tagName.toLowerCase()") == "select":
+                    selected = select_location(field, locator, value)
+                    if not selected:
+                        available = self._option_label_preview(locator)
+                        report["skipped"].append(f"{field} (no matching enabled option for {value} after prerequisites loaded; available options: {available})")
+                        continue
+                    if field.startswith("Manufacturer ") and applicant_name:
+                        self._ensure_manufacturer_company_name(applicant_name, stable_for=0.1)
+                elif not self._fill_control(locator, value):
+                    report["skipped"].append(f"{field} (could not select {value} after prerequisites loaded)")
+                    continue
+                if field in {"Repairer licence number", "Previous CV number", "Previous CV date"} and not self._field_value_matches(locator, value):
+                    report["skipped"].append(f"{field} (portal value did not persist after deferred fill)")
+                    continue
+                report["filled"].append(field)
+            except Exception as exc:
+                report["skipped"].append(f"{field} (deferred fill failed: {exc})")
+
+        # Dependent address selects can refresh the Manufacturer / Trader block
+        # and overwrite its Establishment Name after the earlier top-to-bottom
+        # entry. Reassert the company name after those lists finish loading.
+        if applicant_name:
+            marker = "Manufacturer / Trader establishment name"
+            report["filled"] = [entry for entry in report["filled"] if entry != marker]
+            if self._ensure_manufacturer_company_name(applicant_name):
+                report["filled"].append(marker)
+            else:
+                report["skipped"].append(
+                    f"{marker} (could not persist the PDF company name: {applicant_name})"
+                )
 
         if "Site Dormant / Other choice (control not found)" in report["skipped"]:
             pass
@@ -1140,7 +1939,7 @@ class PortalWorker(threading.Thread):
             "Street", "Door number", "Pincode", "PAN number", "PAN date",
         )
         filled_names = set(report["filled"])
-        for field in ("New goods / machine type choice", "Stamping purpose: Re-verification", "Applicant licence type: Repairer"):
+        for field in ("New goods / machine type choice", "Stamping office/site", "Stamping purpose: Re-verification", "Applicant licence type: Repairer"):
             if field not in filled_names:
                 report["required_blank"].append(f"Portal choice not selected: {field}")
         if new_goods_choice == "Electronic" and "Weighing machine capacity range" not in filled_names:
@@ -1159,6 +1958,52 @@ class PortalWorker(threading.Thread):
         for label, _selector, file_path in attachments:
             if file_path and label not in report["uploaded"]:
                 report["required_blank"].append(f"Portal upload not completed: {label}")
+
+    def _ensure_manufacturer_company_name(self, company_name, stable_for=1.5):
+        """Reassert the PDF company name after delayed portal address callbacks."""
+        if not company_name:
+            return False
+        control = self._field_in_section(
+            r"Manufacturer\s*/\s*Trader\s*/\s*Establishment", r"establishment\s*name"
+        )
+        if control is None or not control.count() or not control.is_visible() or control.is_disabled():
+            return False
+        stable_since = None
+        # The portal's dependent-select callbacks can arrive after the select
+        # appears ready and replace this input (sometimes with the State text).
+        # Hold the final value stable long enough to catch and repair that race.
+        deadline = time.monotonic() + max(6.0, stable_for + 4.0)
+        attempts = 0
+        while time.monotonic() < deadline:
+            try:
+                if self._field_value_matches(control, company_name):
+                    if stable_since is None:
+                        stable_since = time.monotonic()
+                    elif time.monotonic() - stable_since >= stable_for:
+                        return True
+                else:
+                    stable_since = None
+                    if attempts >= 10:
+                        return False
+                    if control.is_editable():
+                        if not self._fill_control(control, company_name):
+                            return False
+                    else:
+                        # Some portal builds mark the same-details text input
+                        # readonly even though its value is submitted. Set its
+                        # native value and notify the portal's bindings.
+                        control.evaluate("""(el, value) => {
+                            const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+                            setter.call(el, value);
+                            el.dispatchEvent(new Event('input', {bubbles: true}));
+                            el.dispatchEvent(new Event('change', {bubbles: true}));
+                            el.dispatchEvent(new Event('blur', {bubbles: true}));
+                        }""", company_name)
+                    attempts += 1
+                self.page.wait_for_timeout(100)
+            except Exception:
+                return False
+        return self._field_value_matches(control, company_name)
 
     @staticmethod
     def _capacity_kg(value: str) -> float:
@@ -1242,7 +2087,7 @@ class PortalWorker(threading.Thread):
             pass
         deadline = time.monotonic() + 8
         while time.monotonic() < deadline:
-            page.wait_for_timeout(250)
+            page.wait_for_timeout(100)
             if page.url != previous_url or self._visible_form_signature() != previous_signature:
                 return
         # A click can be accepted by the browser while portal validation keeps
@@ -1285,7 +2130,8 @@ class PortalWorker(threading.Thread):
 
     def _section_locator(self, heading_text):
         page = self.page
-        heading = page.get_by_text(re.compile(heading_text, re.I)).first
+        headings = self._section_headings(heading_text)
+        heading = headings[0] if headings else page.get_by_text(re.compile(heading_text, re.I)).first
         try:
             if heading.count():
                 for depth in range(1, 8):
@@ -1295,6 +2141,28 @@ class PortalWorker(threading.Thread):
         except Exception:
             pass
         return page.locator("body")
+
+    def _section_headings(self, heading_pattern):
+        """Prefer exact section titles over labels that merely contain the title."""
+        matches = []
+        try:
+            for candidate in self.page.get_by_text(re.compile(heading_pattern, re.I)).all():
+                try:
+                    if candidate.is_visible():
+                        matches.append(candidate)
+                except Exception:
+                    continue
+        except Exception:
+            return []
+        exact = []
+        for candidate in matches:
+            try:
+                text = re.sub(r"\s+", " ", candidate.inner_text()).strip()
+                if re.fullmatch(heading_pattern, text, re.I):
+                    exact.append(candidate)
+            except Exception:
+                continue
+        return exact or matches
 
     def _add_button(self, scope):
         try:
@@ -1345,28 +2213,63 @@ class PortalWorker(threading.Thread):
     def _controls_matching(self, scope, pattern):
         matches = []
         try:
+            # Prefer the browser's accessible label association where present.
+            try:
+                for control in scope.get_by_label(re.compile(pattern, re.I)).all():
+                    if control.is_visible() and control not in matches:
+                        matches.append(control)
+            except Exception:
+                pass
             for control in scope.locator("input,select,textarea").all():
                 if not control.is_visible():
                     continue
                 metadata = control.evaluate(r"""el => {
                     const own = [...(el.labels || [])].map(label => label.innerText || '');
-                    let nearby = '';
-                    let node = el;
-                    for (let depth = 0; node && depth < 5; depth++, node = node.parentElement) {
-                        const labels = [...node.querySelectorAll('label,.control-label,[class*=label]')]
-                            .filter(label => label !== el && label.getClientRects().length)
-                            .map(label => label.innerText || label.textContent || '')
-                            .filter(Boolean);
-                        if (labels.length) { nearby = labels.join(' '); break; }
+                    if (own.length) return own.join(' ');
+                    const visibleLabel = label => label.getClientRects().length &&
+                        (label.innerText || label.textContent || '').trim();
+                    // Match labels by visual proximity. Repeater rows often put
+                    // several labels and controls under one Bootstrap row, so
+                    // ancestor-wide label text makes every input look like
+                    // Application Number, Certificate Number, and Date at once.
+                    const box = el.getBoundingClientRect();
+                    const candidates = [...el.ownerDocument.querySelectorAll('label,.control-label,[class*=label]')]
+                        .filter(visibleLabel).map(label => {
+                            const r = label.getBoundingClientRect();
+                            const verticalGap = box.top - r.bottom;
+                            const horizontalGap = Math.max(0, r.left - box.right, box.left - r.right);
+                            return {label, score: Math.abs(verticalGap) + horizontalGap * 2,
+                                plausible: verticalGap >= -8 && verticalGap <= 90 && horizontalGap <= 120};
+                        }).filter(item => item.plausible).sort((a, b) => a.score - b.score);
+                    if (candidates.length) return candidates[0].label.innerText || candidates[0].label.textContent || '';
+                    // Last resort: a label explicitly targeting this control.
+                    const id = el.id;
+                    if (id) {
+                        const label = el.ownerDocument.querySelector(`label[for="${CSS.escape(id)}"]`);
+                        if (label) return label.innerText || label.textContent || '';
                     }
-                    return [...own, nearby].join(' ');
+                    return '';
                 }""")
                 metadata = " ".join(filter(None, [metadata, control.get_attribute("id"), control.get_attribute("name"), control.get_attribute("placeholder"), control.get_attribute("aria-label"), control.get_attribute("title")]))
-                if re.search(pattern, metadata, re.I):
+                metadata = re.sub(r"[_-]+", " ", metadata)
+                metadata = re.sub(r"\s+", " ", metadata).strip()
+                if re.search(pattern, metadata, re.I) and control not in matches:
                     matches.append(control)
         except Exception:
             pass
         return matches
+
+    @staticmethod
+    def _option_label_preview(locator, limit=24):
+        try:
+            labels = [
+                re.sub(r"\s+", " ", option.inner_text()).strip()
+                for option in locator.locator("option").all()
+            ]
+            labels = [label for label in labels if label and label.lower() not in {"select", "please select"}]
+            return ", ".join(labels[:limit]) or "none"
+        except Exception:
+            return "unavailable"
 
     def _fill_control(self, control, value):
         tag, kind = control.evaluate("el => [el.tagName.toLowerCase(), (el.getAttribute('type') || '').toLowerCase()]")
@@ -1400,7 +2303,7 @@ class PortalWorker(threading.Thread):
         control.evaluate("el => el.blur()")
         return True
 
-    def _fill_items_and_previous_information(self, groups, machines, skipped, filled):
+    def _fill_items_and_previous_information(self, groups, machines, skipped, filled, fallback_application_number=""):
         page = self.page
         category_selector = "select[id*='stampinglabourmeasures'][id$='stamping-type-id']:visible"
         item_scope = self._repeater_section_scope(r"Items\s+to\s+be\s+verified", category_selector)
@@ -1415,11 +2318,9 @@ class PortalWorker(threading.Thread):
                     filled.append(f"Item category {index + 1}")
                     # Category changes can reset quantity asynchronously; wait
                     # for that update before applying the sum of its PDF rows.
-                    page.wait_for_timeout(400)
                     if _is_weights_item(group["description"]):
                         weight = next((machine.get("Weights", "") or machine.get("Denomination", "") for machine in group.get("machines", []) if machine.get("Weights") or machine.get("Denomination")), "")
                         if weight:
-                            page.wait_for_timeout(350)
                             try:
                                 row_scope = category_controls[index].locator("xpath=ancestor::tr[1]")
                                 weight_controls = self._controls_matching(row_scope, r"weight|denomination") if row_scope.count() else []
@@ -1437,7 +2338,6 @@ class PortalWorker(threading.Thread):
                 if quantity.count():
                     total_quantity = sum(_item_count(machine.get("Quantity", "")) for machine in group.get("machines", []))
                     quantity.fill(str(total_quantity))
-                    page.wait_for_timeout(150)
                     if quantity.input_value().strip() != str(total_quantity):
                         quantity.fill(str(total_quantity))
                     if quantity.input_value().strip() == str(total_quantity):
@@ -1450,7 +2350,7 @@ class PortalWorker(threading.Thread):
                 skipped.append(f"Item category/quantity {index + 1}")
 
         previous_scope = self._repeater_section_scope(r"Previous\s+Information", "select:visible")
-        app_pattern = r"application\s*(?:number|no\b)"
+        app_pattern = r"(?:application|app)\s*(?:number|no\b|num\b)"
         cv_pattern = r"(?:certificate|previous\s*cv|cv)\s*(?:number|no\b)"
         model_pattern = r"\bmodel\s*(?:name)?\b"
         def online_controls():
@@ -1464,11 +2364,51 @@ class PortalWorker(threading.Thread):
                     continue
             return controls
 
-        def wait_for_count(getter, required, timeout=30):
+        def model_controls():
+            return self._controls_matching(previous_scope, model_pattern)
+
+        def previous_row_count():
+            # The portal keeps one Delete button for every added row. Count by
+            # those row controls so an unfinished row containing both a Model
+            # Name and Online select is never counted twice.
+            return 1 + len(delete_buttons())
+
+        def delete_buttons():
+            buttons = []
+            try:
+                for control in previous_scope.locator("button,a,[role='button'],input[type='button']").all():
+                    if not control.is_visible():
+                        continue
+                    label = " ".join(filter(None, [
+                        control.inner_text(timeout=500), control.get_attribute("value"),
+                        control.get_attribute("aria-label"), control.get_attribute("title"),
+                    ]))
+                    if re.fullmatch(r"\s*(?:delete|remove)\s*", label, re.I):
+                        buttons.append(control)
+            except Exception:
+                pass
+            return buttons
+
+        def select_online_when_ready(control, timeout=15):
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                try:
+                    if control.is_visible() and control.is_enabled():
+                        selected_label = self._norm(control.locator("option:checked").first.inner_text())
+                        if selected_label == "online" or selected_label.startswith("online other state"):
+                            return True
+                        if self._select_best(control, "Online"):
+                            return True
+                except Exception:
+                    pass
+                page.wait_for_timeout(100)
+            return False
+
+        def wait_for_count(getter, required, timeout=12):
             deadline = time.monotonic() + timeout
             current = getter()
             while len(current) < required and time.monotonic() < deadline:
-                page.wait_for_timeout(250)
+                page.wait_for_timeout(100)
                 current = getter()
             return current
 
@@ -1477,69 +2417,132 @@ class PortalWorker(threading.Thread):
             skipped.append("Previous Information: Online/Other State control not found")
             return
 
-        shared_application_number = next((str(row.get("Application number", "")).strip() for row in machines if str(row.get("Application number", "")).strip()), "")
+        desired_rows = len(machines)
+        # Repeated attempts can leave surplus rows in the open portal form.
+        # Trim those first, then click Add exactly once per missing row.
+        current_rows = previous_row_count()
+        while current_rows > desired_rows:
+            removes = delete_buttons()
+            if not removes:
+                skipped.append(f"Previous Information: portal has {current_rows} rows; could not remove extras to reach {desired_rows}")
+                break
+            try:
+                removes[-1].click()
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline:
+                    updated = previous_row_count()
+                    if updated < current_rows:
+                        current_rows = updated
+                        break
+                    page.wait_for_timeout(100)
+                else:
+                    skipped.append("Previous Information: Delete did not remove the extra row")
+                    break
+            except Exception as exc:
+                skipped.append(f"Previous Information: could not remove extra row: {exc}")
+                break
+        while current_rows < desired_rows:
+            add = self._add_button(previous_scope)
+            if add is None:
+                skipped.append(f"Previous Information: Add control not found; portal has {current_rows} rows, needs {desired_rows}")
+                break
+            try:
+                add.click()
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline:
+                    updated = previous_row_count()
+                    if updated > current_rows:
+                        current_rows = updated
+                        break
+                    page.wait_for_timeout(100)
+                else:
+                    skipped.append("Previous Information: Add did not create one new row")
+                    break
+            except Exception as exc:
+                skipped.append(f"Previous Information: could not add row: {exc}")
+                break
+
+        shared_application_number = next((
+            str(row.get("Application number", "")).strip()
+            for row in machines if str(row.get("Application number", "")).strip()
+        ), "") or str(fallback_application_number or "").strip()
 
         for index, machine in enumerate(machines):
             states = online_controls()
             if index == 0:
                 state_control = states[0] if states else None
             else:
-                models = self._controls_matching(previous_scope, model_pattern)
-                if len(states) <= index:
-                    previous_model_count = len(models)
-                    add = self._add_button(previous_scope)
-                    if add is not None:
-                        try:
-                            add.click()
-                            deadline = time.monotonic() + 10
-                            while time.monotonic() < deadline:
-                                models = self._controls_matching(previous_scope, model_pattern)
-                                if len(models) > previous_model_count:
-                                    break
-                                page.wait_for_timeout(200)
-                        except Exception as exc:
-                            skipped.append(f"Previous Information: could not add machine section {index + 1}: {exc}")
-                    else:
-                        skipped.append(f"Previous Information: Add More control not found for machine {index + 1}")
-                models = self._controls_matching(previous_scope, model_pattern)
+                models = model_controls()
                 if models:
-                    # Model controls become Online/Other State selectors after
-                    # selection. Always target the newest visible model row.
-                    model_control = models[-1]
+                    # The portal replaces Model Name with Online/Other State
+                    # only after the dropdown is opened and a choice is made.
+                    model_control = models[0]
                     model_value = machine.get("Instrument description", "")
-                    selected_model = self._select_best(model_control, model_value)
-                    if not selected_model:
-                        selected_model = self._select_first_available(model_control)
+                    old_model_count = len(models)
+                    try:
+                        model_control.click()
+                        selected_model = self._select_best(model_control, model_value)
+                        if not selected_model:
+                            selected_model = self._select_first_available(model_control)
+                    except Exception:
+                        selected_model = False
                     if selected_model:
-                        filled.append(f"Previous Information Model {index + 1}")
+                        deadline = time.monotonic() + 8
+                        while time.monotonic() < deadline:
+                            models = model_controls()
+                            states = online_controls()
+                            if len(models) < old_model_count:
+                                filled.append(f"Previous Information Model {index + 1}")
+                                break
+                            page.wait_for_timeout(100)
+                        else:
+                            skipped.append(f"Previous Information Model for machine {index + 1} (selection did not change the row to Online/Other State)")
                     else:
-                        skipped.append(f"Previous Information Model for machine {index + 1}")
+                        skipped.append(f"Previous Information Model for machine {index + 1} (no non-Select option could be chosen)")
                     states = wait_for_count(online_controls, index + 1)
                 else:
-                    skipped.append(f"Previous Information Model for machine {index + 1}")
                     states = online_controls()
                 state_control = states[index] if len(states) > index else None
 
-            if state_control is None or not self._select_best(state_control, "Online"):
+            if state_control is None or not select_online_when_ready(state_control):
                 skipped.append(f"Previous Information Online option for machine {index + 1}")
                 continue
             filled.append(f"Previous Information Online {index + 1}")
-            page.wait_for_timeout(350)
-
             apps = wait_for_count(lambda: self._controls_matching(previous_scope, app_pattern), index + 1)
             cvs = wait_for_count(lambda: self._controls_matching(previous_scope, cv_pattern), index + 1)
             app_no = machine.get("Application number", "") or shared_application_number
             cv_no = machine.get("Previous CV number", "")
+            row_value_controls = []
             for label, controls, value in (("Application number", apps, app_no), ("Certificate number", cvs, cv_no)):
                 if index >= len(controls) or not value:
-                    skipped.append(f"Previous Information {label} for machine {index + 1}")
+                    reason = "source PDF application number unavailable" if label == "Application number" and not value else "control not found or source value unavailable"
+                    skipped.append(f"Previous Information {label} for machine {index + 1} ({reason})")
                     continue
                 try:
                     control = controls[index]
-                    if self._fill_control(control, value) and self._field_value_matches(control, value):
+                    row_value_controls.append(control)
+                    persisted = False
+                    for _attempt in range(3):
+                        try:
+                            if self._fill_control(control, value):
+                                deadline = time.monotonic() + 1.2
+                                while time.monotonic() < deadline:
+                                    if self._field_value_matches(control, value):
+                                        persisted = True
+                                        break
+                                    page.wait_for_timeout(100)
+                            if persisted:
+                                break
+                        except Exception:
+                            page.wait_for_timeout(150)
+                    if persisted:
                         filled.append(f"Previous Information {label} {index + 1}")
                     else:
-                        skipped.append(f"Previous Information {label} for machine {index + 1} (value did not persist)")
+                        try:
+                            actual = control.input_value().strip()
+                        except Exception:
+                            actual = "unavailable"
+                        skipped.append(f"Previous Information {label} for machine {index + 1} (value did not persist; field shows: {actual or 'blank'})")
                 except Exception as exc:
                     skipped.append(f"Previous Information {label} for machine {index + 1}: {exc}")
 
@@ -1547,6 +2550,7 @@ class PortalWorker(threading.Thread):
             dates = self._controls_matching(previous_scope, r"certificate\s*date|previous\s*cv\s*date")
             if index < len(dates):
                 deadline = time.monotonic() + 30
+                refreshed_identifiers = False
                 while time.monotonic() < deadline:
                     try:
                         certificate_date = dates[index].input_value().strip()
@@ -1555,7 +2559,19 @@ class PortalWorker(threading.Thread):
                             break
                     except Exception:
                         break
-                    page.wait_for_timeout(300)
+                    if not refreshed_identifiers:
+                        # Some portal builds attach the date lookup to blur on
+                        # both identifiers. Re-fire those normal form events
+                        # once in case the initial asynchronous lookup was lost.
+                        for identifier in row_value_controls:
+                            try:
+                                identifier.dispatch_event("input")
+                                identifier.dispatch_event("change")
+                                identifier.evaluate("el => el.blur()")
+                            except Exception:
+                                pass
+                        refreshed_identifiers = True
+                    page.wait_for_timeout(150)
                 else:
                     skipped.append(f"Previous Information Certificate date for machine {index + 1} (portal did not populate it)")
             else:
@@ -1608,6 +2624,7 @@ class PortalWorker(threading.Thread):
 
         grouped_rows = [group.get("machines", []) for group in groups]
         flat_rows = [row for group in grouped_rows for row in group]
+        flat_row_indices = {id(row): index for index, row in enumerate(flat_rows)}
         def data_rows_for(table):
             rows = table.locator("tr").all()
             return [row for row in rows if row.locator("input,select,textarea").count()]
@@ -1641,6 +2658,7 @@ class PortalWorker(threading.Thread):
             expanded.append((table, headers, current_rows))
         tables = expanded
         pattern_map = {
+            "Quantity (As Per Specification)": r"quantity\s*\(?\s*as\s*per\s*(?:specification|spec)",
             "Denomination": r"denomination|weight\b",
             "Class": r"\bclass\b",
             "Maximum capacity": r"\bmax(?:imum)?\b",
@@ -1661,17 +2679,29 @@ class PortalWorker(threading.Thread):
                 if not field:
                     continue
                 value = machine.get("Weights", "") or machine.get("Denomination", "") if field == "Denomination" else machine.get(field, "")
+                if field == "Quantity (As Per Specification)":
+                    value = machine.get("Quantity", "") or "1"
                 if field == "Previous CV number":
                     value = machine.get("Previous CV number", "")
-                if _is_weights_item(machine.get("Instrument description", "")) and field not in {"Denomination", "Previous CV number"}:
+                if _is_weights_item(machine.get("Instrument description", "")) and field not in {
+                    "Denomination", "Previous CV number", "Quantity (As Per Specification)"
+                }:
                     continue
                 controls = cell.locator("input,select,textarea")
                 if not value or not controls.count():
                     continue
                 try:
-                    if self._fill_control(controls.first, value):
+                    if field == "Previous CV number":
+                        selected = self._select_previous_cv_option(controls.first, value)
+                    else:
+                        selected = self._fill_control(controls.first, value)
+                    if selected:
                         found.add(field)
                         filled.append(f"Machine {machine_index + 1} {field}")
+                    elif field == "Previous CV number":
+                        skipped.append(
+                            f"Machine {machine_index + 1} Previous CV dropdown did not select {value}"
+                        )
                 except Exception:
                     pass
             return found
@@ -1692,12 +2722,55 @@ class PortalWorker(threading.Thread):
             group_rows = grouped_rows[cursor] if cursor < len(grouped_rows) else []
             for row_idx, row_locator in enumerate(data_rows[:len(group_rows)]):
                 machine = group_rows[row_idx]
-                global_index = flat_rows.index(machine)
+                global_index = flat_row_indices.get(id(machine), cursor + row_idx)
                 found = fill_row(row_locator, headers, machine, global_index)
                 for key in pattern_map:
                     if machine.get(key) and key not in found:
                         skipped.append(f"Machine {global_index + 1} {key}")
             cursor += 1
+
+    def _select_previous_cv_option(self, control, certificate_number, timeout=12):
+        """Select and verify the exact certificate belonging to this machine row."""
+        if control.evaluate("el => el.tagName.toLowerCase()") != "select":
+            return False
+        target = self._norm(str(certificate_number or ""))
+        if not target:
+            return False
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            choices = []
+            for option in control.locator("option").all():
+                label = re.sub(r"\s+", " ", option.inner_text()).strip()
+                value = option.get_attribute("value")
+                if not label or not value or label.lower() in {"select", "please select"}:
+                    continue
+                if option.get_attribute("disabled") is not None:
+                    continue
+                normalized_label = self._norm(label)
+                normalized_value = self._norm(value)
+                # The portal appends a certificate date to each dropdown
+                # label, so match the whole CV number followed by a boundary.
+                # This prevents a shorter number matching a longer one.
+                if (normalized_label == target or normalized_label.startswith(target + " ")
+                        or normalized_value == target or normalized_value.startswith(target + " ")):
+                    choices.append((label, value))
+            # Require one exact certificate match; partial CV matches can pick
+            # the wrong machine when the certificates differ only at the end.
+            if len(choices) == 1 and self._choose_select_option(control, choices[0][1]):
+                try:
+                    selected_label = re.sub(
+                        r"\s+", " ", control.locator("option:checked").first.inner_text()
+                    ).strip()
+                    selected_value = control.input_value().strip()
+                    normalized_label = self._norm(selected_label)
+                    normalized_value = self._norm(selected_value)
+                    if (normalized_label == target or normalized_label.startswith(target + " ")
+                            or normalized_value == target or normalized_value.startswith(target + " ")):
+                        return True
+                except Exception:
+                    pass
+            self.page.wait_for_timeout(250)
+        return False
 
     def _fill_machine_rows(self, rows, skipped):
         """Fill indexed machine rows when the portal exposes matching controls."""
@@ -1812,8 +2885,8 @@ class PortalWorker(threading.Thread):
         for option in locator.locator("option").all():
             try:
                 label = re.sub(r"\s+", " ", option.inner_text()).strip()
-                value = option.get_attribute("value")
-                if label and value is not None and label.lower() != "select":
+                value = str(option.evaluate("el => el.value") or "")
+                if label and value and label.lower() != "select" and not option.evaluate("el => el.disabled"):
                     options.append((label, value))
             except Exception:
                 pass
@@ -1822,14 +2895,156 @@ class PortalWorker(threading.Thread):
         norm = self._norm(target)
         exact = [o for o in options if self._norm(o[0]) == norm]
         if len(exact) == 1:
-            locator.select_option(value=exact[0][1]); return True
+            return self._choose_select_option(locator, exact[0][1])
         partial = [o for o in options if norm in self._norm(o[0]) or self._norm(o[0]) in norm]
         if len(partial) == 1:
-            locator.select_option(value=partial[0][1]); return True
+            return self._choose_select_option(locator, partial[0][1])
         scored = sorted(((SequenceMatcher(None, norm, self._norm(label)).ratio(), label, value) for label, value in options), reverse=True)
         if scored and scored[0][0] >= 0.62 and (len(scored) == 1 or scored[0][0] - scored[1][0] >= 0.08):
-            locator.select_option(value=scored[0][2]); return True
+            return self._choose_select_option(locator, scored[0][2])
         return False
+
+    @staticmethod
+    def _choose_select_option(locator, value) -> bool:
+        """Open a native dropdown, choose its option, and confirm it persisted."""
+        try:
+            if not locator.is_visible() or not locator.is_enabled():
+                return False
+            # Several portal controls (Tamil Nadu state selectors in
+            # particular) are already set when a new form opens. Selecting the
+            # same native option again fires a change handler that can clear
+            # all downstream address lists. Preserve the existing selection.
+            if str(locator.input_value()).strip() == str(value).strip():
+                return True
+            # The portal attaches dependent-list refresh handlers to mouse
+            # interaction. Open the control before selecting and verify the
+            # value instead of assuming the change event was accepted.
+            locator.click(timeout=2500)
+            locator.select_option(value=value, timeout=5000)
+            return str(locator.input_value()).strip() == str(value).strip()
+        except Exception:
+            return False
+
+    def _select_town_matching_street(self, town_control, street_control, town_target, address, section_pattern):
+        """Choose a matching town by exact suffix matches against its Street options."""
+        if not town_target or street_control is None:
+            return None
+        location = _locality_components(address)
+        prefix = location["prefix_parts"]
+        if not prefix:
+            return None
+
+        # Candidate streets are contiguous suffixes immediately to the left of
+        # Town/Village, tried from longest to shortest. This supports streets
+        # split across several comma-separated address components.
+        candidate_streets = []
+        first_prefix_is_door = bool(
+            len(prefix) > 1 and re.fullmatch(r"\d+[/-]\d+[A-Za-z]?(?:\s+.*)?", prefix[0])
+        )
+        for start in range(len(prefix)):
+            if start == 0 and first_prefix_is_door:
+                continue
+            candidate = ", ".join(prefix[start:])
+            if candidate:
+                candidate_streets.append((start, candidate, self._norm(candidate)))
+        candidate_streets.sort(key=lambda item: (item[0], -len(item[2])))
+
+        town_matches = []
+        target_norm = self._norm(town_target)
+        try:
+            for option in town_control.locator("option").all():
+                label = re.sub(r"\s+", " ", option.inner_text()).strip()
+                value = str(option.evaluate("el => el.value") or "")
+                if (value and label and label.lower() not in {"select", "please select"}
+                        and not option.evaluate("el => el.disabled")):
+                    if self._norm(label) == target_norm:
+                        town_matches.append((label, value))
+        except Exception:
+            return None
+
+        if not town_matches:
+            if not self._select_best(town_control, town_target):
+                return None
+            try:
+                selected = town_control.locator("option:checked").first
+                town_matches = [(selected.inner_text().strip(), str(selected.evaluate("el => el.value") or ""))]
+            except Exception:
+                return None
+
+        def street_options():
+            result = []
+            for option in street_control.locator("option").all():
+                label = re.sub(r"\s+", " ", option.inner_text()).strip()
+                value = str(option.evaluate("el => el.value") or "")
+                if label and value and label.lower() not in {"select", "please select"} and not option.evaluate("el => el.disabled"):
+                    result.append((label, value, self._norm(label)))
+            return result
+
+        for _town_label, town_value in town_matches:
+            try:
+                previous_signature = tuple((norm, value) for _label, value, norm in street_options())
+                already_selected = town_control.input_value() == town_value
+                if not self._choose_select_option(town_control, town_value):
+                    continue
+            except Exception:
+                continue
+
+            deadline = time.monotonic() + 8
+            last_signature = previous_signature
+            stable_since = None
+            while time.monotonic() < deadline:
+                try:
+                    options = street_options()
+                    signature = tuple((norm, value) for _label, value, norm in options)
+                    matches = [
+                        (start, candidate, option_label, option_value)
+                        for start, candidate, candidate_norm in candidate_streets
+                        for option_label, option_value, option_norm in options
+                        if candidate_norm == option_norm
+                    ]
+                    # For repeated town labels, require the dependent Street
+                    # list to refresh before trusting a match from that row.
+                    refreshed = (
+                        signature != previous_signature
+                        or len(town_matches) == 1
+                        or already_selected
+                    )
+                    if signature != previous_signature and options:
+                        self._save_address_option_snapshot(section_pattern, "Street", street_control)
+                    if refreshed and matches:
+                        start, _candidate, street_label, _street_value = min(
+                            matches, key=lambda item: (item[0], -len(self._norm(item[1])))
+                        )
+                        return {
+                            "street": street_label,
+                            "door_number": ", ".join(prefix[:start]),
+                        }
+                    if signature != last_signature:
+                        last_signature = signature
+                        stable_since = time.monotonic()
+                    elif signature != previous_signature and stable_since is not None and time.monotonic() - stable_since >= 0.3:
+                        break
+                except Exception:
+                    pass
+                self.page.wait_for_timeout(100)
+
+        return None
+
+    def _select_exact_option(self, locator, target) -> bool:
+        """Select the first exact option when a dependent dropdown repeats labels."""
+        norm = self._norm(target)
+        if not norm:
+            return False
+        try:
+            for option in locator.locator("option").all():
+                label = re.sub(r"\s+", " ", option.inner_text()).strip()
+                value = str(option.evaluate("el => el.value") or "")
+                if value and label and self._norm(label) == norm and not option.evaluate("el => el.disabled"):
+                    if self._choose_select_option(locator, value):
+                        return True
+        except Exception:
+            return False
+        return self._select_best(locator, target)
 
     def _file_input_for(self, section_text):
         page = self.page
@@ -1865,6 +3080,17 @@ class PortalWorker(threading.Thread):
                 continue
         return None
 
+    def _find_visible_edit(self):
+        page = self.page
+        for candidate in page.locator("button:visible,input[type='button']:visible,input[type='submit']:visible,[role='button']:visible,a:visible").all():
+            try:
+                label = " ".join(filter(None, [candidate.inner_text(timeout=500), candidate.get_attribute("value"), candidate.get_attribute("aria-label"), candidate.get_attribute("title")])).strip()
+                if re.fullmatch(r"edit", label, re.I) and candidate.is_enabled():
+                    return candidate
+            except Exception:
+                continue
+        return None
+
     def _submit(self):
         page = self.page
         payment_text = re.compile(r"make payment|proceed to payment|pay now|payment gateway|payment successful", re.I)
@@ -1876,6 +3102,7 @@ class PortalWorker(threading.Thread):
         submit = self._find_visible_submit()
         if submit is None:
             raise RuntimeError("No visible Submit control is present on the current portal page. The application was not submitted; continue filling the current page.")
+        page.once("dialog", lambda dialog: dialog.accept())
         submit.click(timeout=10000)
         try:
             page.wait_for_load_state("domcontentloaded", timeout=15000)
@@ -1948,12 +3175,16 @@ class App(tk.Tk):
         kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
         kernel32.GlobalFree.restype = ctypes.c_void_p
 
+        # Use this window as clipboard owner. Passing NULL works on many
+        # systems, but can fail when the app is launched from a packaged
+        # Windows process or while another app briefly owns the clipboard.
+        owner = widget.winfo_id() if widget and widget.winfo_exists() else None
         opened = False
-        for _ in range(12):
-            if user32.OpenClipboard(None):
+        for _ in range(40):
+            if user32.OpenClipboard(owner):
                 opened = True
                 break
-            time.sleep(0.05)
+            time.sleep(0.075)
         if not opened:
             raise ctypes.WinError(ctypes.get_last_error())
         handle = None
@@ -1979,6 +3210,25 @@ class App(tk.Tk):
             user32.CloseClipboard()
             if handle and not transferred:
                 kernel32.GlobalFree(handle)
+
+    @staticmethod
+    def _copy_text_via_powershell(value):
+        """Use the Windows clipboard cmdlet as a fallback for locked Tk/Win32 clipboard calls."""
+        encoded = base64.b64encode(str(value).encode("utf-8")).decode("ascii")
+        script = (
+            "$b=[Console]::In.ReadToEnd().Trim();"
+            "$t=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b));"
+            "Set-Clipboard -Value $t"
+        )
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-STA", "-Command", script],
+            input=encoded + "\n", text=True, encoding="ascii", capture_output=True,
+            timeout=12, creationflags=flags,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "PowerShell clipboard command failed").strip()
+            raise RuntimeError(detail)
 
     def _show_copyable_error(self, title, message, parent=None):
         """Show an error in selectable text with a one-click copy action."""
@@ -2015,11 +3265,20 @@ class App(tk.Tk):
         footer = ttk.Frame(body)
         footer.pack(fill="x", pady=(10, 0))
         ttk.Label(footer, textvariable=feedback).pack(side="left")
-        def copy_error():
+        def select_all(_event=None):
+            text.tag_add("sel", "1.0", "end-1c")
+            text.mark_set("insert", "1.0")
+            text.focus_set()
+            return "break"
+        def copy_error(_event=None):
+            copied = False
+            native_exc = tk_exc = None
             try:
                 self._copy_text_to_clipboard(str(message), dialog)
                 feedback.set("Copied. Paste with Ctrl+V.")
-            except Exception as native_exc:
+                copied = True
+            except Exception as exc:
+                native_exc = exc
                 try:
                     dialog.clipboard_clear()
                     dialog.clipboard_append(str(message))
@@ -2027,10 +3286,20 @@ class App(tk.Tk):
                     if dialog.clipboard_get() != str(message):
                         raise tk.TclError("Clipboard verification failed")
                     feedback.set("Copied. Paste with Ctrl+V.")
-                except Exception as tk_exc:
-                    text.tag_add("sel", "1.0", "end-1c")
-                    text.focus_set()
-                    feedback.set(f"Windows blocked clipboard access ({native_exc}; {tk_exc}). The error is selected: press Ctrl+C or choose Save error…")
+                    copied = True
+                except Exception as exc:
+                    tk_exc = exc
+            if not copied:
+                try:
+                    self._copy_text_via_powershell(str(message))
+                    feedback.set("Copied. Paste with Ctrl+V.")
+                    copied = True
+                except Exception as ps_exc:
+                    select_all()
+                    feedback.set(f"Copy failed ({native_exc}; {tk_exc}; {ps_exc}). The text is selected; choose Save error… to get a text file.")
+            # On failure, let Tk's standard Text class binding handle Ctrl+C.
+            # Returning "break" here used to swallow that fallback keystroke.
+            return "break" if copied else None
         def save_error():
             path = filedialog.asksaveasfilename(parent=dialog, title="Save error message", defaultextension=".txt", initialfile="stamping_error.txt", filetypes=[("Text files", "*.txt")])
             if not path:
@@ -2041,10 +3310,13 @@ class App(tk.Tk):
             except OSError as exc:
                 feedback.set(f"Could not save error text: {exc}")
         tk.Button(footer, text="Copy error", command=copy_error, bg=p.get("accent", "#1261a0"), fg="#ffffff", activebackground=p.get("accent_active", p.get("accent", "#1261a0")), activeforeground="#ffffff", font=("Segoe UI Semibold", 10), padx=14, pady=6, relief="flat", borderwidth=0, highlightthickness=0).pack(side="left")
+        tk.Button(footer, text="Select all", command=select_all, bg=p.get("card", "#ffffff"), fg=p.get("fg", "#243247"), activebackground=p.get("border", "#c5ccd6"), font=("Segoe UI Semibold", 10), padx=14, pady=6, relief="solid", borderwidth=1, highlightthickness=0).pack(side="left", padx=(8, 0))
         tk.Button(footer, text="Save error…", command=save_error, bg=p.get("card", "#ffffff"), fg=p.get("fg", "#243247"), activebackground=p.get("border", "#c5ccd6"), font=("Segoe UI Semibold", 10), padx=14, pady=6, relief="solid", borderwidth=1, highlightthickness=0).pack(side="left", padx=(8, 0))
         tk.Button(footer, text="Close", command=dialog.destroy, bg=p.get("card", "#ffffff"), fg=p.get("fg", "#243247"), activebackground=p.get("border", "#c5ccd6"), font=("Segoe UI Semibold", 10), padx=14, pady=6, relief="solid", borderwidth=1, highlightthickness=0).pack(side="right")
-        dialog.bind("<Control-c>", lambda _event: copy_error())
-        dialog.bind("<Control-C>", lambda _event: copy_error())
+        text.bind("<Control-a>", select_all)
+        text.bind("<Control-A>", select_all)
+        text.bind("<Control-c>", copy_error)
+        text.bind("<Control-C>", copy_error)
         dialog.grab_set()
         dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
 
@@ -2166,6 +3438,10 @@ class App(tk.Tk):
         ttk.Label(machine, text="Review or correct each machine row read from the certificate pages.", style="Muted.Card.TLabel").pack(anchor="w", pady=(4, 8))
         self.machine_field_frame = ttk.Frame(machine, style="Card.TFrame")
         self.machine_field_frame.pack(fill="x")
+        previous_info = self._card(body, "Previous Information")
+        self.previous_info_status = tk.StringVar(value="No Previous Information errors.")
+        ttk.Label(previous_info, textvariable=self.previous_info_status, style="Muted.Card.TLabel",
+                  wraplength=930, justify="left").pack(anchor="w", pady=(8, 0))
         self.pan_name = tk.StringVar(); self.pan_number = tk.StringVar(); self.pan_date = tk.StringVar(); self.license_number = tk.StringVar()
         self.repairer_establishment_var = tk.StringVar()
         self._set_fields({})
@@ -2255,15 +3531,37 @@ class App(tk.Tk):
     def read_pdf(self):
         path = self.files.get("certificate")
         if not path:
-            messagebox.showinfo("Choose the previous certificate", "Select the previous CV or purchase invoice PDF first.")
+            messagebox.showerror("Previous certificate required", "Select the previous CV or purchase invoice PDF first.")
             return
         try:
             page_count, meaningful_page_count, values, machines = extract_certificate_document(path)
             if not machines:
-                messagebox.showwarning("No selectable text found", "This PDF appears to be a scan. Use a text-searchable PDF; OCR is not included in this local build.")
+                messagebox.showerror("No selectable text found", "This PDF appears to be a scan. Use a text-searchable PDF; OCR is not included in this local build.")
                 return
-            values.update({"Applicant business name": values.get("Applicant / establishment name", ""), "Applicant contact name": self.contact_var.get(), "Registered name": self.contact_var.get(), "Registered email": self.user_var.get(), "Registered mobile": self.mobile_var.get(), "Used by / trader contact": self.business_var.get() or values.get("Repairer business name", ""), "PAN name": self.pan_name.get(), "PAN number": self.pan_number.get(), "PAN date": self.pan_date.get(), "Repairer name": self.pan_name.get(), "Repairer licence number": self.license_number.get()})
-            self.repairer_establishment_var.set(self.business_var.get() or values.get("Repairer business name", ""))
+            account_index = self.account_combo.current()
+            account = self.accounts[account_index] if 0 <= account_index < len(self.accounts) else {}
+            repairer_company = str(account.get("repairer_company_name") or "").strip() or values.get("Repairer business name", "").strip()
+            repairer_mobile = str(account.get("repairer_mobile") or "").strip() or values.get("Repairer mobile", "").strip()
+            repairer_contact = ", ".join(part for part in (repairer_company, repairer_mobile) if part)
+            # When the selected account has no repairer identity saved yet,
+            # learn it from this certificate and store it with that account.
+            # Existing saved values are never overwritten by another PDF.
+            if account_index >= 0 and account and (repairer_company or repairer_mobile):
+                changed = False
+                if repairer_company and not account.get("repairer_company_name"):
+                    account["repairer_company_name"] = repairer_company
+                    changed = True
+                if repairer_mobile and not account.get("repairer_mobile"):
+                    account["repairer_mobile"] = repairer_mobile
+                    changed = True
+                if changed:
+                    self.profile["portal_accounts"] = self.accounts
+                    try:
+                        save_vault(self.profile)
+                    except Exception as exc:
+                        self._show_copyable_error("Could not save repairer profile details", str(exc))
+            values.update({"Applicant business name": values.get("Applicant / establishment name", ""), "Applicant contact name": self.contact_var.get(), "Registered name": self.contact_var.get(), "Registered email": self.user_var.get(), "Registered mobile": self.mobile_var.get(), "Used by / trader contact": repairer_contact, "PAN name": self.pan_name.get(), "PAN number": self.pan_number.get(), "PAN date": self.pan_date.get(), "Repairer name": self.pan_name.get(), "Repairer licence number": self.license_number.get()})
+            self.repairer_establishment_var.set(repairer_contact)
             self._set_fields(values, machines)
             ignored = page_count - meaningful_page_count
             self.status.set(f"Draft read from {Path(path).name}: {page_count} pages, {len(machines)} machine(s), {ignored} blank/footer page(s) ignored. Review every value before filling the portal.")
@@ -2329,6 +3627,13 @@ class App(tk.Tk):
             self.pan_number.set(account.get("pan_number", ""))
             self.pan_date.set(account.get("pan_date", ""))
             self.license_number.set(account.get("license_number", ""))
+            repairer_contact = ", ".join(
+                part for part in (
+                    str(account.get("repairer_company_name", "")).strip(),
+                    str(account.get("repairer_mobile", "")).strip(),
+                ) if part
+            )
+            self.repairer_establishment_var.set(repairer_contact)
             if self.vars:
                 self.vars["PAN name"].set(self.pan_name.get())
                 self.vars["PAN number"].set(self.pan_number.get())
@@ -2338,7 +3643,7 @@ class App(tk.Tk):
     def edit_account(self):
         index = self.account_combo.current()
         if index < 0 or index >= len(self.accounts):
-            messagebox.showinfo("Choose an account", "Select an email from the dropdown before editing its credentials.")
+            messagebox.showerror("Choose an account", "Select an email from the dropdown before editing its credentials.")
             return
         self.add_account(edit_index=index)
 
@@ -2347,19 +3652,21 @@ class App(tk.Tk):
         window.title("Edit portal account" if edit_index is not None else "Add portal account")
         window.transient(self)
         window.grab_set()
-        window.geometry("540x690")
+        window.geometry("560x760")
         pad = ttk.Frame(window, padding=18); pad.pack(fill="both", expand=True)
         ttk.Label(pad, text="Portal sign-in and matching PAN profile", style="Section.TLabel").pack(anchor="w")
-        ttk.Label(pad, text="All details and the PAN image are encrypted together for this email account.", style="Sub.TLabel", wraplength=480).pack(anchor="w", pady=(4, 12))
+        ttk.Label(pad, text="Sign-in, company/mobile, license, and PAN details are encrypted together for this email account.", style="Sub.TLabel", wraplength=500).pack(anchor="w", pady=(4, 12))
 
         email_var = tk.StringVar(); password_var = tk.StringVar()
         pan_name_var = tk.StringVar(); pan_number_var = tk.StringVar(); pan_date_var = tk.StringVar()
         license_var = tk.StringVar(); image_label = tk.StringVar(value="No PAN image selected")
+        repairer_company_var = tk.StringVar(); repairer_mobile_var = tk.StringVar()
         image_data = {"b64": "", "name": ""}
         loaded_email = {"value": ""}
         fields = ttk.Frame(pad); fields.pack(fill="x")
         entries = (
             ("Registered email address", email_var, ""), ("Portal password", password_var, "•"),
+            ("Company name", repairer_company_var, ""), ("Mobile number", repairer_mobile_var, ""),
             ("Name on PAN card", pan_name_var, ""), ("PAN number", pan_number_var, ""),
             ("Date on PAN card", pan_date_var, ""), ("License Number", license_var, ""),
         )
@@ -2379,7 +3686,7 @@ class App(tk.Tk):
             try:
                 content = Path(path).read_bytes()
                 if len(content) > 1024 * 1024:
-                    messagebox.showwarning("Image too large", "The portal accepts uploaded files up to 1 MB. Choose a smaller PAN image.", parent=window)
+                    messagebox.showerror("Image too large", "The portal accepts uploaded files up to 1 MB. Choose a smaller PAN image.", parent=window)
                     return
                 image_data["b64"] = base64.b64encode(content).decode("ascii")
                 image_data["name"] = Path(path).name
@@ -2397,7 +3704,7 @@ class App(tk.Tk):
             existing = next((item for item in self.accounts if item.get("username", "").casefold() == email), None)
             if not existing:
                 if edit_index is None and loaded_email["value"] and loaded_email["value"] != email:
-                    password_var.set(""); pan_name_var.set(""); pan_number_var.set("")
+                    password_var.set(""); repairer_company_var.set(""); repairer_mobile_var.set(""); pan_name_var.set(""); pan_number_var.set("")
                     pan_date_var.set(""); license_var.set("")
                     image_data["b64"] = ""; image_data["name"] = ""
                     image_label.set("No PAN image selected")
@@ -2405,6 +3712,8 @@ class App(tk.Tk):
                 return
             loaded_email["value"] = email
             password_var.set(existing.get("password", ""))
+            repairer_company_var.set(existing.get("repairer_company_name", ""))
+            repairer_mobile_var.set(existing.get("repairer_mobile", ""))
             pan_name_var.set(existing.get("pan_name", ""))
             pan_number_var.set(existing.get("pan_number", ""))
             pan_date_var.set(existing.get("pan_date", ""))
@@ -2419,6 +3728,8 @@ class App(tk.Tk):
             current = self.accounts[edit_index]
             email_var.set(current.get("username", ""))
             password_var.set(current.get("password", ""))
+            repairer_company_var.set(current.get("repairer_company_name", ""))
+            repairer_mobile_var.set(current.get("repairer_mobile", ""))
             pan_name_var.set(current.get("pan_name", ""))
             pan_number_var.set(current.get("pan_number", ""))
             pan_date_var.set(current.get("pan_date", ""))
@@ -2431,22 +3742,24 @@ class App(tk.Tk):
         def save_account():
             email, password = email_var.get().strip(), password_var.get()
             if not email or not password:
-                messagebox.showwarning("Missing sign-in", "Enter the registered email and portal password.", parent=window)
+                messagebox.showerror("Missing sign-in", "Enter the registered email and portal password.", parent=window)
                 return
             if not pan_name_var.get().strip() or not pan_number_var.get().strip() or not pan_date_var.get().strip() or not image_data["b64"]:
-                messagebox.showwarning("PAN profile incomplete", "Enter the PAN name, number, and date, and choose a PAN card image.", parent=window)
+                messagebox.showerror("PAN profile incomplete", "Enter the PAN name, number, and date, and choose a PAN card image.", parent=window)
                 return
             old_accounts = self.accounts
             match_index = next((i for i, item in enumerate(self.accounts) if item.get("username", "").casefold() == email.casefold()), None)
             if edit_index is not None:
                 duplicate = match_index is not None and match_index != edit_index
                 if duplicate:
-                    messagebox.showwarning("Email already saved", "That email belongs to another saved account. Use a unique email address.", parent=window)
+                    messagebox.showerror("Email already saved", "That email belongs to another saved account. Use a unique email address.", parent=window)
                     return
                 match_index = edit_index
             record = dict(self.accounts[match_index]) if match_index is not None else {}
             record.update({
                 "username": email, "password": password,
+                "repairer_company_name": repairer_company_var.get().strip(),
+                "repairer_mobile": repairer_mobile_var.get().strip(),
                 "pan_name": pan_name_var.get().strip(), "pan_number": pan_number_var.get().strip(),
                 "pan_date": pan_date_var.get().strip(), "license_number": license_var.get().strip(),
                 "pan_image_b64": image_data["b64"], "pan_image_name": image_data["name"],
@@ -2480,7 +3793,7 @@ class App(tk.Tk):
     def open_portal(self):
         self._on_account_selected()
         if not self.user_var.get() or not self.pass_var.get():
-            messagebox.showwarning("Sign-in needed", "Choose an email from the dropdown or add an account.")
+            messagebox.showerror("Sign-in needed", "Choose an email from the dropdown or add an account.")
             return
         self._ensure_worker()
         has_draft = bool(self.machine_rows and self.files.get("certificate"))
@@ -2497,11 +3810,13 @@ class App(tk.Tk):
     def fill_application(self):
         self._on_account_selected()
         if not self.user_var.get() or not self.pass_var.get():
-            messagebox.showwarning("Sign-in needed", "Choose an email from the dropdown or add an account.")
+            messagebox.showerror("Sign-in needed", "Choose an email from the dropdown or add an account.")
             return
         if not self.files.get("certificate") or not self.machine_rows:
-            messagebox.showwarning("PDF draft required", "Choose the previous CV PDF and select Read PDF and fill draft first.")
+            messagebox.showerror("PDF draft required", "Choose the previous CV PDF and select Read PDF and fill draft first.")
             return
+        if hasattr(self, "previous_info_status"):
+            self.previous_info_status.set("Checking Previous Information fields…")
         self._ensure_worker()
         payload = self._application_payload()
         payload["credentials"] = {"username": self.user_var.get(), "password": self.pass_var.get()}
@@ -2516,7 +3831,10 @@ class App(tk.Tk):
         fields = {k: v.get().strip() for k, v in self.vars.items()}
         # The portal's establishment name is the company name parsed/reviewed
         # from the certificate. PAN identity and repairer identity are separate.
-        company_name = fields.get("Applicant business name", "").strip() or fields.get("Applicant / establishment name", "").strip()
+        # The PDF's M/S line is the source of truth for the establishment
+        # name; don't let a stale secondary entry replace it (for example with
+        # the state value copied by the portal's same-details checkbox).
+        company_name = fields.get("Applicant / establishment name", "").strip() or fields.get("Applicant business name", "").strip()
         if company_name:
             fields["Applicant business name"] = company_name
             fields["Applicant / establishment name"] = company_name
@@ -2529,7 +3847,12 @@ class App(tk.Tk):
         fields["Registered name"] = fields.get("Registered name", "") or self.contact_var.get().strip()
         fields["Registered email"] = self.user_var.get().strip() or fields.get("Registered email", "")
         fields["Registered mobile"] = fields.get("Registered mobile", "") or self.mobile_var.get().strip()
-        fields["Used by / trader contact"] = self.repairer_establishment_var.get().strip() or fields.get("Used by / trader contact", "") or self.business_var.get().strip()
+        account_index = self.account_combo.current()
+        account = self.accounts[account_index] if 0 <= account_index < len(self.accounts) else {}
+        repairer_company = account.get("repairer_company_name", "").strip() or fields.get("Repairer business name", "").strip()
+        repairer_mobile = account.get("repairer_mobile", "").strip() or fields.get("Repairer mobile", "").strip()
+        repairer_contact = ", ".join(part for part in (repairer_company, repairer_mobile) if part)
+        fields["Used by / trader contact"] = repairer_contact or self.repairer_establishment_var.get().strip() or fields.get("Used by / trader contact", "")
         image_payload = None
         account_index = self.account_combo.current()
         account = self.accounts[account_index] if 0 <= account_index < len(self.accounts) else {}
@@ -2557,10 +3880,10 @@ class App(tk.Tk):
 
     def submit_application(self):
         if not self.worker or not self.worker.is_alive():
-            messagebox.showinfo("Sign in first", "Log in through the app browser and prepare the application first.")
+            messagebox.showerror("Sign in first", "Log in through the app browser and prepare the application first.")
             return
         if not self.worker.ready_for_submit:
-            messagebox.showinfo("Finish the review pages first", "Use Start application or Fill now / retry and complete the portal pages through the final review page before submitting.")
+            messagebox.showerror("Finish the review pages first", "Use Start application or Fill now / retry and complete the portal pages through the final review page before submitting.")
             return
         if not messagebox.askyesno("Submit application", "Submit this completed application to the Tamil Nadu Labour Department?\n\nReview the portal pages first. This is the final application submission; the app will not make a payment."):
             return
@@ -2572,21 +3895,22 @@ class App(tk.Tk):
             while True:
                 kind, value = self.msgq.get_nowait()
                 if kind == "error":
-                    self.status.set(value); self._show_copyable_error("Automation stopped", value)
+                    self.status.set(value)
+                    if hasattr(self, "previous_info_status"):
+                        self.previous_info_status.set(value)
+                    self._show_copyable_error("Automation stopped", value)
                 elif kind == "details":
                     self.status.set(f"Filled: {', '.join(value['filled']) or 'none'}. Uploaded: {', '.join(value['uploaded']) or 'none'}. Needs manual review: {', '.join(value['skipped']) or 'no unmatched fields reported'}.")
-                    if not value.get("automatic"):
-                        messagebox.showinfo("Review the portal", self.status.get())
                 elif kind == "payment":
-                    self.status.set(value); messagebox.showinfo("Payment page reached", value)
+                    self.status.set(value)
                 elif kind == "submitted":
-                    self.status.set(value); messagebox.showinfo("Application submitted", value)
+                    self.status.set(value)
                 elif kind == "login_ok":
-                    self.status.set(value); messagebox.showinfo("Sign-in confirmed", value)
+                    self.status.set("Sign-in complete.")
                 elif kind == "login_failed":
-                    self.status.set(value); messagebox.showwarning("Sign-in not confirmed", value)
+                    self.status.set(value); self._show_copyable_error("Sign-in failed", value)
                 elif kind == "ready_to_submit":
-                    self.status.set(value); messagebox.showinfo("Review before submission", value)
+                    self.status.set(value)
                 else:
                     self.status.set(value)
         except queue.Empty: pass
@@ -2595,4 +3919,3 @@ class App(tk.Tk):
 
 if __name__ == "__main__":
     App().mainloop()
-
