@@ -1543,7 +1543,8 @@ class PortalWorker(threading.Thread):
 
         same_details_checked = False
         ordered_fields = [
-            "New goods / machine type choice", "Stamping office/site",
+            "New goods / machine type choice", "Weighing machine capacity range",
+            "Stamping office/site",
             "Stamping purpose: Re-verification", "Applicant licence type: Repairer",
             "Repairer name", "Site Dormant / Other choice", "Repairer licence number",
             "Repairer licence date", "Licensed valid Up To", "Applicant business name",
@@ -1872,6 +1873,10 @@ class PortalWorker(threading.Thread):
                 report["filled"].append(field)
             except Exception as exc:
                 report["skipped"].append(f"{field}: {exc}")
+                # Do not let later fields overtake a field that failed at its
+                # place in the requested top-to-bottom sequence. The user can
+                # correct the first failure and retry from that point.
+                break
 
         # Revisit fields that started disabled after their prerequisite choices
         # or uploads have now been applied. This keeps the main pass top-to-bottom
