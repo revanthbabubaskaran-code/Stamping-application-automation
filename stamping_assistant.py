@@ -2816,72 +2816,53 @@ class PortalWorker(threading.Thread):
                 skipped.append(f"Previous Information: could not create row {current_rows + 1}: {exc}")
                 return
 
+        # Finish converting every pre-existing Model Name row to Online before
+        # entering any identifiers. This keeps row creation/setup as a strict
+        # first phase and application/certificate/date entry as the second.
+        states = online_controls()
+        models = model_controls()
+        while models:
+            row_index = len(states)
+            if row_index >= desired_rows:
+                break
+            model_control = models[0]
+            model_value = machines[row_index].get("Instrument description", "")
+            selected_model = False
+            try:
+                model_control.click()
+                for option in model_control.locator("option").all():
+                    if (model_value and self._norm(option.inner_text()) == self._norm(model_value)
+                            and not option.evaluate("el => el.disabled")
+                            and str(option.evaluate("el => el.value") or "")):
+                        selected_model = self._choose_select_option(model_control, option.evaluate("el => el.value"))
+                        break
+            except Exception:
+                selected_model = False
+            if not selected_model:
+                skipped.append(f"Previous Information Model for machine {row_index + 1} (item option not available: {model_value})")
+                return
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                states = online_controls()
+                models = model_controls()
+                if len(states) > row_index or not models:
+                    break
+                page.wait_for_timeout(25)
+            if len(states) <= row_index:
+                skipped.append(f"Previous Information: model selection for machine {row_index + 1} did not create its Online row")
+                return
+            filled.append(f"Previous Information Model {row_index + 1}")
+        if len(online_controls()) < desired_rows:
+            skipped.append(f"Previous Information: prepared {len(online_controls())} Online row(s), needs {desired_rows}; no identifiers were entered")
+            return
+
         for index, machine in enumerate(machines):
             current_rows = previous_row_count()
-            while current_rows < index + 1:
-                add = previous_add_button()
-                if add is None:
-                    skipped.append(f"Previous Information: Add control not found; portal has {current_rows} rows, needs {desired_rows}")
-                    break
-                try:
-                    add.click()
-                    deadline = time.monotonic() + 5
-                    while time.monotonic() < deadline:
-                        updated = previous_row_count()
-                        if updated > current_rows:
-                            current_rows = updated
-                            break
-                        page.wait_for_timeout(100)
-                    else:
-                        skipped.append("Previous Information: Add did not create one new row")
-                        break
-                except Exception as exc:
-                    skipped.append(f"Previous Information: could not add row: {exc}")
-                    break
-
             if current_rows < index + 1:
+                skipped.append(f"Previous Information: row setup stopped before machine {index + 1}; no identifiers were entered for remaining rows")
                 return
             states = online_controls()
-            if index == 0:
-                state_control = states[0] if states else None
-            else:
-                models = model_controls()
-                if len(states) <= index and models:
-                    # The portal replaces Model Name with Online/Other State
-                    # only after the dropdown is opened and a choice is made.
-                    model_control = models[0]
-                    model_value = machine.get("Instrument description", "")
-                    old_model_count = len(models)
-                    try:
-                        model_control.click()
-                        selected_model = False
-                        for option in model_control.locator("option").all():
-                            if (model_value and self._norm(option.inner_text()) == self._norm(model_value)
-                                    and not option.evaluate("el => el.disabled")
-                                    and str(option.evaluate("el => el.value") or "")):
-                                selected_model = self._choose_select_option(model_control, option.evaluate("el => el.value"))
-                                break
-                    except Exception:
-                        selected_model = False
-                    if selected_model:
-                        deadline = time.monotonic() + 5
-                        while time.monotonic() < deadline:
-                            models = model_controls()
-                            states = online_controls()
-                            if len(models) < old_model_count:
-                                filled.append(f"Previous Information Model {index + 1}")
-                                break
-                            page.wait_for_timeout(100)
-                        else:
-                            skipped.append(f"Previous Information Model for machine {index + 1} (selection did not change the row to Online/Other State)")
-                            continue
-                    else:
-                        skipped.append(f"Previous Information Model for machine {index + 1} (item option not available: {model_value})")
-                        continue
-                    states = wait_for_count(online_controls, index + 1)
-                else:
-                    states = online_controls()
-                state_control = states[index] if len(states) > index else None
+            state_control = states[index] if len(states) > index else None
 
             if state_control is None or not select_online_when_ready(state_control):
                 skipped.append(f"Previous Information Online option for machine {index + 1}")
