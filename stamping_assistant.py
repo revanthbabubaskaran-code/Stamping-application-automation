@@ -2608,7 +2608,7 @@ class PortalWorker(threading.Thread):
             return None
 
         def wait_for_row_inputs(state_control):
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + 12
             while time.monotonic() < deadline:
                 result = row_inputs(state_control)
                 if result is not None:
@@ -2700,7 +2700,7 @@ class PortalWorker(threading.Thread):
             return
         # The portal may ignore Add while the first row is still set to its
         # placeholder. Confirm Online before measuring rows or clicking Add.
-        if not select_online_when_ready(states[0], timeout=5):
+        if not select_online_when_ready(states[0]):
             skipped.append("Previous Information: first Online/Other State option could not be selected; Add was not attempted")
             return
 
@@ -2715,7 +2715,7 @@ class PortalWorker(threading.Thread):
                 break
             try:
                 removes[-1].click()
-                deadline = time.monotonic() + 5
+                deadline = time.monotonic() + 8
                 while time.monotonic() < deadline:
                     updated = previous_row_count()
                     if updated < current_rows:
@@ -2909,7 +2909,7 @@ class PortalWorker(threading.Thread):
                     if persisted:
                         filled.append(f"Previous Information {label} {index + 1}")
                         continue
-                    ready_deadline = time.monotonic() + 5
+                    ready_deadline = time.monotonic() + 15
                     while time.monotonic() < ready_deadline:
                         try:
                             if control.is_visible() and control.is_enabled() and control.is_editable():
@@ -2952,7 +2952,7 @@ class PortalWorker(threading.Thread):
             # Certificate date is computed by the portal after both identifiers.
             dates = [None] * index + [date_control]
             if index < len(dates):
-                deadline = time.monotonic() + 5
+                deadline = time.monotonic() + 30
                 refreshed_identifiers = False
                 while time.monotonic() < deadline:
                     try:
