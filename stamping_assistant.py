@@ -990,6 +990,16 @@ class PortalWorker(threading.Thread):
                     return 2
             if page.locator("#newgood:visible").count():
                 return 1
+            if re.search(r"items to be verified", body):
+                # Page 2 repeats the Items to be verified heading, but has an
+                # editable instrument table with machine-specific columns.
+                for table in page.locator("table:visible").all():
+                    headers = self._norm(" ".join(table.locator("tr").all_inner_texts()[:3]))
+                    if (re.search(r"denomination|weight", headers)
+                            and re.search(r"max", headers)
+                            and re.search(r"machine", headers)
+                            and table.locator("input:visible,select:visible").count()):
+                        return 2
             if re.search(r"establishment details|previous information", body) and not re.search(
                     r"items to be verified.*machine no|previous verification certificate information", body):
                 return 1
@@ -1027,7 +1037,7 @@ class PortalWorker(threading.Thread):
         self.ready_for_submit = False
         if self.workflow_step <= 0:
             self.final_edit_retry_used = False
-        report = {"filled": [], "skipped": [], "uploaded": [], "required_blank": []}
+        report = {"filled": [], "skipped": [], "uploaded": [], "required_blank": [], "workflow_step": self.workflow_step}
         fields = payload["fields"]
         machines = payload.get("machine_rows") or [fields]
         groups = payload.get("item_groups") or self._group_items(machines)
@@ -4196,8 +4206,6 @@ class App(tk.Tk):
             return
         if not self._validate_draft_confirmation():
             return
-        if hasattr(self, "previous_info_status"):
-            self.previous_info_status.set("Checking Previous Information fields…")
         self._ensure_worker()
         payload = self._application_payload()
         payload["credentials"] = {"username": self.user_var.get(), "password": self.pass_var.get()}
@@ -4332,6 +4340,8 @@ class App(tk.Tk):
                     self._show_copyable_error("Automation stopped", value)
                 elif kind == "details":
                     self.status.set(f"Filled: {', '.join(value['filled']) or 'none'}. Uploaded: {', '.join(value['uploaded']) or 'none'}. Needs manual review: {', '.join(value['skipped']) or 'no unmatched fields reported'}.")
+                    if hasattr(self, "previous_info_status") and value.get("workflow_step", 0) >= 2:
+                        self.previous_info_status.set("Machine details page checked. First page address fields were left unchanged.")
                 elif kind == "payment":
                     self.status.set(value)
                 elif kind == "submitted":
