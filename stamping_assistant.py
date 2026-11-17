@@ -3201,7 +3201,8 @@ class PortalWorker(threading.Thread):
                         )
                         return {
                             "street": street_label,
-                            # A literal hyphen in the Locality slot means the certificate has no numbered door; the portal still requires the submitted value to be "-".\n                        "door_number": ", ".join(prefix[:start]) or (prefix[0] if prefix and prefix[0] == "-" else ""),
+                            # A literal hyphen in the Locality slot means the certificate has no numbered door; the portal still requires the submitted value to be "-".
+                        "door_number": ", ".join(prefix[:start]) or (prefix[0] if prefix and prefix[0] == "-" else ""),
                         }
                     if signature != last_signature:
                         last_signature = signature
