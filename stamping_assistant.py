@@ -2698,6 +2698,11 @@ class PortalWorker(threading.Thread):
         if not states:
             skipped.append("Previous Information: Online/Other State control not found")
             return
+        # The portal may ignore Add while the first row is still set to its
+        # placeholder. Confirm Online before measuring rows or clicking Add.
+        if not select_online_when_ready(states[0], timeout=5):
+            skipped.append("Previous Information: first Online/Other State option could not be selected; Add was not attempted")
+            return
 
         desired_rows = len(machines)
         # Repeated attempts can leave surplus rows in the open portal form.
@@ -2741,6 +2746,7 @@ class PortalWorker(threading.Thread):
             try:
                 before_models = len(model_controls())
                 before_states = len(online_controls())
+                before_rows = current_rows
                 add.click()
                 # Poll promptly but allow the portal's dependent-row request
                 # to finish. Some sessions take longer than one second even
@@ -2756,6 +2762,29 @@ class PortalWorker(threading.Thread):
                     if len(online_controls()) > before_states:
                         row_ready = True
                         break
+                    if previous_row_count() > before_rows:
+                        # Some portal versions insert a Model Name control
+                        # whose label is not associated with the select.
+                        # Identify it by the exact requested model option.
+                        model_value = machines[current_rows].get("Instrument description", "")
+                        online_ids = {control.get_attribute("id") for control in online_controls()}
+                        for candidate in previous_scope.locator("select:visible").all():
+                            if candidate.get_attribute("id") in online_ids:
+                                continue
+                            try:
+                                if any(self._norm(option.inner_text()) == self._norm(model_value)
+                                       and option.get_attribute("value")
+                                       and not option.evaluate("el => el.disabled")
+                                       for option in candidate.locator("option").all()):
+                                    model_control = candidate
+                                    break
+                            except Exception:
+                                continue
+                        if model_control is not None:
+                            break
+                        if len(online_controls()) > before_states:
+                            row_ready = True
+                            break
                     page.wait_for_timeout(25)
                 if model_control is None and not row_ready:
                     skipped.append("Previous Information: Add was clicked, but the new row did not appear after waiting for the portal")
