@@ -518,11 +518,13 @@ class PortalWorker(threading.Thread):
                         self.messages.put(("opened", "Portal opened in bundled Chromium and saved sign-in filled. Enter the CAPTCHA there; the application will continue automatically if a PDF draft is ready."))
                     elif cmd == "fill":
                         if not self._logged_in():
-                            self.pending_application = payload
-                            self.waiting_for_login = True
-                            self._open_login_page()
-                            self._fill_login(payload.get("credentials", {}))
-                            self.messages.put(("opened", "Portal opened in bundled Chromium. Enter the CAPTCHA; login and application filling will continue automatically."))
+                            if self._is_login_page():
+                                self.pending_application = payload
+                                self.waiting_for_login = True
+                                self._fill_login(payload.get("credentials", {}))
+                                self.messages.put(("opened", "Sign in is needed. The current login page was kept open; complete the CAPTCHA to continue."))
+                            else:
+                                self.messages.put(("error", "The current portal page could not be confirmed as signed in. It was left open; sign in manually if needed, then retry."))
                         else:
                             report = self._fill_form(payload)
                             self.messages.put(("details", report))
@@ -749,6 +751,14 @@ class PortalWorker(threading.Thread):
         if page.get_by_text(re.compile(r"THE LEGAL METROLOGY ACT", re.I)).count():
             return True
         return False
+
+    def _is_login_page(self) -> bool:
+        """Recognize the login page without navigating away from the current form."""
+        try:
+            return bool(self.page.locator('input[type="password"]:visible').count()
+                        or re.search(r"/login(?:[/?#]|$)", self.page.url, re.I))
+        except Exception:
+            return False
 
     def _click_if_visible(self, locator) -> bool:
         try:
@@ -978,9 +988,10 @@ class PortalWorker(threading.Thread):
                 headers = self._norm(" ".join(table.locator("tr").all_inner_texts()[:3]))
                 if ("machine no" in headers or "machine number" in headers) and table.locator("input:visible,select:visible").count():
                     return 2
-            if page.locator("#Stamping:visible").count() or page.locator("#newgood:visible").count():
+            if page.locator("#newgood:visible").count():
                 return 1
-            if re.search(r"establishment details|previous information", body):
+            if re.search(r"establishment details|previous information", body) and not re.search(
+                    r"items to be verified.*machine no|previous verification certificate information", body):
                 return 1
         except Exception:
             pass
@@ -993,7 +1004,24 @@ class PortalWorker(threading.Thread):
         if current_step is not None:
             self.workflow_step = current_step
         elif self.workflow_step < 2:
-            self._navigate_to_stamping_form()
+            # Only navigate from a known dashboard. An unidentified page may
+            # be a step the user reached manually, so leave it untouched.
+            try:
+                body = self._norm(self.page.locator("body").inner_text(timeout=1500))
+            except Exception:
+                body = ""
+            dashboard = bool(re.search(
+                r"the legal metrology act.{0,100}verification and stamping", body
+            )) and not re.search(r"establishment details|previous information|items to be verified", body)
+            if dashboard:
+                self._navigate_to_stamping_form()
+                current_step = self._detect_current_workflow_step()
+                if current_step is not None:
+                    self.workflow_step = current_step
+                else:
+                    raise RuntimeError("The stamping form did not open. The current page was left unchanged; open New Stamping manually and retry.")
+            else:
+                raise RuntimeError("Could not identify the current portal step. The page was left unchanged; retry after confirming the visible page, or use its Next button manually.")
         else:
             raise RuntimeError("Could not identify the current portal step. Leave the page open and retry so the assistant can resume without navigating away.")
         self.ready_for_submit = False
