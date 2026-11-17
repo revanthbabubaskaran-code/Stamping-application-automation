@@ -1783,9 +1783,20 @@ class PortalWorker(threading.Thread):
                 if field in {"Registered name", "Registered email", "Registered mobile",
                              "Repairer licence date", "Licensed valid Up To"}:
                     deadline = time.monotonic() + 20
-                    while time.monotonic() < deadline and not self._field_value_matches(locator, value):
+                    # These controls are populated by the portal after the
+                    # licence number is accepted. Saved profile values can be
+                    # stale or belong to a different licence, so compare only
+                    # against emptiness here; the portal's own read-only value
+                    # is authoritative and must not block later form fields.
+                    def portal_value_loaded():
+                        try:
+                            return bool(locator.input_value().strip())
+                        except Exception:
+                            return False
+
+                    while time.monotonic() < deadline and not portal_value_loaded():
                         page.wait_for_timeout(150)
-                    if self._field_value_matches(locator, value):
+                    if portal_value_loaded():
                         report["filled"].append(field)
                         continue
                     report["skipped"].append(f"{field} (portal has not populated the expected value yet)")
