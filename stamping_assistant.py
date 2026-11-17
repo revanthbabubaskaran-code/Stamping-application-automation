@@ -312,6 +312,7 @@ def extract_certificate_document(path: str) -> tuple[int, int, dict[str, str], l
         machine = _extract_machine_record(page["text"], page["tables"])
         if machine.get("Machine number") or machine.get("Instrument make") or _is_weights_item(machine.get("Instrument description", "")):
             machine["Previous CV number"] = first(r"CV\s*No\.?\s*:\s*([^\n]+)", page["text"])
+            machine["Source PDF page"] = page["page_number"]
             machine["Application number"] = first(r"Application\s+Number\s*:\s*([^\n]+)", page["text"])
             machine["Additional fee"] = first(r"50%\s+Additional\s+Fee\s*:\s*([\d,.]+)", page["text"]) or machine.get("Additional fee", "")
             machine["Stamping office/site"] = first(r"Stamping\s+at\s+(Office|Site)", page["text"])
@@ -321,7 +322,7 @@ def extract_certificate_document(path: str) -> tuple[int, int, dict[str, str], l
     if not machines or first_machine_page is None:
         raise RuntimeError("No machine table was found in the PDF. Use a text-searchable previous CV or check the document.")
     values = extract_certificate(first_machine_page["text"], first_machine_page["tables"])
-    values.update(machines[0])
+    values.update({key: value for key, value in machines[0].items() if key != "Source PDF page"})
     values["Repairer name"] = ""  # Filled from the selected PAN profile in the UI.
     if values.get("Stamping office/site", "").lower() == "site":
         fees = [re.sub(r"[^\d.]", "", row.get("Additional fee", "")) for row in machines]
@@ -1401,7 +1402,23 @@ class PortalWorker(threading.Thread):
             # Details so this sequence cannot jump into the second address.
             if field in establishment_labels:
                 expected_tag = "input" if field in {"Applicant / establishment name", "Door number", "Pincode"} else None
-                return self._field_in_section(section_pattern, establishment_labels[field], expected_tag)
+                control = self._field_in_section(section_pattern, establishment_labels[field], expected_tag)
+                if control is not None:
+                    return control
+                # Some portal builds render unassociated labels as plain text.
+                # Search the smaller address section by input metadata and its
+                # nearby field group so Door Number does not silently stay blank.
+                if field == "Door number":
+                    scope = self._section_locator(section_pattern)
+                    for candidate in scope.locator("input:visible").all():
+                        try:
+                            meta = " ".join(str(candidate.get_attribute(key) or "") for key in ("id", "name", "placeholder", "aria-label", "title"))
+                            group_text = candidate.evaluate("el => { const g=el.closest('.form-group,.mb-3,.field,.col,td') || el.parentElement; return g ? (g.innerText || g.textContent || '') : ''; }")
+                            if re.search(r"door\s*(?:number|no\b)", self._norm(meta + " " + group_text), re.I):
+                                return candidate
+                        except Exception:
+                            continue
+                return None
             return self._portal_field(field)
 
         for field, value in fields.items():
@@ -2493,31 +2510,47 @@ class PortalWorker(threading.Thread):
         cv_pattern = r"(?:certificate|previous\s*cv|cv)\s*(?:number|no\b)"
         model_pattern = r"\bmodel\s*(?:name)?\b"
 
-        def previous_value_controls(pattern):
-            """Find repeated inputs even when the portal renders labels as plain text."""
-            matches = self._controls_matching(page, pattern)
-            if matches:
-                return sorted(matches, key=lambda control: float(control.evaluate("el => el.getBoundingClientRect().top")))
-
-            # Older portal markup sometimes places the visible field caption in
-            # a generic span/div rather than a label. Resolve that caption to
-            # its nearest input, scoped to the Previous Information section.
-            section = self._section_locator(r"Previous\s+Information")
-            labels = section.locator("label,.control-label,[class*=label],span,div,td,th").all()
-            # Include generic text nodes too; some portal revisions do not give
-            # their visible captions a label-related class.
-            labels.extend(section.locator("*").all())
-            for label in labels:
-                try:
-                    text = re.sub(r"\s+", " ", label.inner_text(timeout=300)).strip()
-                    if not text or len(text) > 80 or not re.search(pattern, text, re.I):
-                        continue
-                    control = self._control_near_label(label, section, "input:not([type='hidden']),textarea")
-                    if control is not None and all(existing != control for existing in matches):
-                        matches.append(control)
-                except Exception:
+        def row_inputs(state_control):
+            """Locate identifier inputs in this Online row, never in another row."""
+            for depth in range(1, 10):
+                scope = state_control.locator("xpath=" + "/".join([".."] * depth))
+                states_in_scope = []
+                for select in scope.locator("select:visible").all():
+                    labels = [self._norm(option.inner_text()) for option in select.locator("option").all()]
+                    if "online" in labels:
+                        states_in_scope.append(select)
+                if len(states_in_scope) > 1:
+                    break
+                inputs = scope.locator("input:visible:not([type='hidden']):not([type='button']):not([type='submit']):not([type='file']),textarea:visible").all()
+                if len(inputs) != 3:
                     continue
-            return sorted(matches, key=lambda control: float(control.evaluate("el => el.getBoundingClientRect().top")))
+                # The portal's Online row has Date, Application Number, then
+                # Certificate Number in DOM order. Use semantic labels first;
+                # the three-input layout covers unassociated/duplicate labels.
+                result = []
+                for pattern, fallback in ((app_pattern, 1), (cv_pattern, 2), (r"certificate\s*date|previous\s*cv\s*date", 0)):
+                    candidates = self._controls_matching(scope, pattern)
+                    unique = []
+                    for candidate in candidates:
+                        handle = candidate.element_handle()
+                        if not any(existing.evaluate("(el, other) => el === other", handle) for existing in unique):
+                            unique.append(candidate)
+                    result.append(unique[0] if len(unique) == 1 else inputs[fallback])
+                # Ambiguous semantic labels must not assign one input twice.
+                if any(result[i].evaluate("(el, other) => el === other", result[j].element_handle()) for i in range(3) for j in range(i)):
+                    return inputs[1], inputs[2], inputs[0]
+                return tuple(result)
+            return None
+
+        def wait_for_row_inputs(state_control):
+            deadline = time.monotonic() + 12
+            while time.monotonic() < deadline:
+                result = row_inputs(state_control)
+                if result is not None:
+                    return result
+                page.wait_for_timeout(50)
+            return None
+
         def online_controls():
             controls = []
             for control in previous_scope.locator("select:visible").all():
@@ -2566,14 +2599,14 @@ class PortalWorker(threading.Thread):
                             return True
                 except Exception:
                     pass
-                page.wait_for_timeout(100)
+                page.wait_for_timeout(50)
             return False
 
         def wait_for_count(getter, required, timeout=12):
             deadline = time.monotonic() + timeout
             current = getter()
             while len(current) < required and time.monotonic() < deadline:
-                page.wait_for_timeout(100)
+                page.wait_for_timeout(50)
                 current = getter()
             return current
 
@@ -2599,46 +2632,102 @@ class PortalWorker(threading.Thread):
                     if updated < current_rows:
                         current_rows = updated
                         break
-                    page.wait_for_timeout(100)
+                    page.wait_for_timeout(50)
                 else:
                     skipped.append("Previous Information: Delete did not remove the extra row")
                     break
             except Exception as exc:
                 skipped.append(f"Previous Information: could not remove extra row: {exc}")
                 break
-        while current_rows < desired_rows:
-            add = self._add_button(previous_scope)
-            if add is None:
-                skipped.append(f"Previous Information: Add control not found; portal has {current_rows} rows, needs {desired_rows}")
-                break
-            try:
-                add.click()
-                deadline = time.monotonic() + 8
-                while time.monotonic() < deadline:
-                    updated = previous_row_count()
-                    if updated > current_rows:
-                        current_rows = updated
-                        break
-                    page.wait_for_timeout(100)
-                else:
-                    skipped.append("Previous Information: Add did not create one new row")
-                    break
-            except Exception as exc:
-                skipped.append(f"Previous Information: could not add row: {exc}")
-                break
-
         shared_application_number = next((
             str(row.get("Application number", "")).strip()
             for row in machines if str(row.get("Application number", "")).strip()
         ), "") or str(fallback_application_number or "").strip()
 
+        # Create each needed row immediately after the preceding Add. Select
+        # its item/model at once so the portal can transform it to the next
+        # Online row while the remaining rows are being prepared. Identifier
+        # filling happens after all rows exist; certificate date lookups can
+        # then finish without delaying the next Add click.
+        while current_rows < desired_rows:
+            add = self._add_button(previous_scope)
+            if add is None:
+                skipped.append(f"Previous Information: Add control not found; portal has {current_rows} rows, needs {desired_rows}")
+                return
+            try:
+                before_models = len(model_controls())
+                add.click()
+                # The portal initially creates a Model Name select. Wait only
+                # for that new control, then select this machine's exact item.
+                model_deadline = time.monotonic() + 0.9
+                model_control = None
+                while time.monotonic() < model_deadline:
+                    models = model_controls()
+                    if len(models) > before_models:
+                        model_control = models[-1]
+                        break
+                    page.wait_for_timeout(25)
+                if model_control is None:
+                    skipped.append("Previous Information: new row did not appear within 1 second of Add")
+                    return
+                model_value = machines[current_rows].get("Instrument description", "")
+                selected_model = False
+                model_control.click()
+                for option in model_control.locator("option").all():
+                    if (model_value and self._norm(option.inner_text()) == self._norm(model_value)
+                            and not option.evaluate("el => el.disabled")
+                            and str(option.evaluate("el => el.value") or "")):
+                        selected_model = self._choose_select_option(model_control, option.evaluate("el => el.value"))
+                        break
+                if not selected_model:
+                    skipped.append(f"Previous Information Model for machine {current_rows + 1} (item option not available: {model_value})")
+                    return
+                state_deadline = time.monotonic() + 0.9
+                while time.monotonic() < state_deadline:
+                    states = online_controls()
+                    if len(states) > current_rows:
+                        current_rows += 1
+                        break
+                    page.wait_for_timeout(25)
+                else:
+                    skipped.append("Previous Information: new Online row did not load within 1 second of model selection")
+                    return
+                filled.append(f"Previous Information Model {current_rows}")
+            except Exception as exc:
+                skipped.append(f"Previous Information: could not create row {current_rows + 1}: {exc}")
+                return
+
         for index, machine in enumerate(machines):
+            current_rows = previous_row_count()
+            while current_rows < index + 1:
+                add = self._add_button(previous_scope)
+                if add is None:
+                    skipped.append(f"Previous Information: Add control not found; portal has {current_rows} rows, needs {desired_rows}")
+                    break
+                try:
+                    add.click()
+                    deadline = time.monotonic() + 8
+                    while time.monotonic() < deadline:
+                        updated = previous_row_count()
+                        if updated > current_rows:
+                            current_rows = updated
+                            break
+                        page.wait_for_timeout(100)
+                    else:
+                        skipped.append("Previous Information: Add did not create one new row")
+                        break
+                except Exception as exc:
+                    skipped.append(f"Previous Information: could not add row: {exc}")
+                    break
+
+            if current_rows < index + 1:
+                return
             states = online_controls()
             if index == 0:
                 state_control = states[0] if states else None
             else:
                 models = model_controls()
-                if models:
+                if len(states) <= index and models:
                     # The portal replaces Model Name with Online/Other State
                     # only after the dropdown is opened and a choice is made.
                     model_control = models[0]
@@ -2646,9 +2735,13 @@ class PortalWorker(threading.Thread):
                     old_model_count = len(models)
                     try:
                         model_control.click()
-                        selected_model = self._select_best(model_control, model_value)
-                        if not selected_model:
-                            selected_model = self._select_first_available(model_control)
+                        selected_model = False
+                        for option in model_control.locator("option").all():
+                            if (model_value and self._norm(option.inner_text()) == self._norm(model_value)
+                                    and not option.evaluate("el => el.disabled")
+                                    and str(option.evaluate("el => el.value") or "")):
+                                selected_model = self._choose_select_option(model_control, option.evaluate("el => el.value"))
+                                break
                     except Exception:
                         selected_model = False
                     if selected_model:
@@ -2662,8 +2755,10 @@ class PortalWorker(threading.Thread):
                             page.wait_for_timeout(100)
                         else:
                             skipped.append(f"Previous Information Model for machine {index + 1} (selection did not change the row to Online/Other State)")
+                            continue
                     else:
-                        skipped.append(f"Previous Information Model for machine {index + 1} (no non-Select option could be chosen)")
+                        skipped.append(f"Previous Information Model for machine {index + 1} (item option not available: {model_value})")
+                        continue
                     states = wait_for_count(online_controls, index + 1)
                 else:
                     states = online_controls()
@@ -2673,8 +2768,13 @@ class PortalWorker(threading.Thread):
                 skipped.append(f"Previous Information Online option for machine {index + 1}")
                 continue
             filled.append(f"Previous Information Online {index + 1}")
-            apps = wait_for_count(lambda: previous_value_controls(app_pattern), index + 1)
-            cvs = wait_for_count(lambda: previous_value_controls(cv_pattern), index + 1)
+            identifiers = wait_for_row_inputs(state_control)
+            if identifiers is None:
+                skipped.append(f"Previous Information row {index + 1}: identifier inputs did not load in this row")
+                return
+            app_control, cv_control, date_control = identifiers
+            apps = [None] * index + [app_control]
+            cvs = [None] * index + [cv_control]
             app_no = machine.get("Application number", "") or shared_application_number
             cv_no = machine.get("Previous CV number", "")
             row_value_controls = []
@@ -2731,7 +2831,7 @@ class PortalWorker(threading.Thread):
                     skipped.append(f"Previous Information {label} for machine {index + 1}: {exc}")
 
             # Certificate date is computed by the portal after both identifiers.
-            dates = previous_value_controls(r"certificate\s*date|previous\s*cv\s*date")
+            dates = [None] * index + [date_control]
             if index < len(dates):
                 deadline = time.monotonic() + 30
                 refreshed_identifiers = False
@@ -2760,6 +2860,9 @@ class PortalWorker(threading.Thread):
                     skipped.append(f"Previous Information Certificate date for machine {index + 1} (portal did not populate it)")
             else:
                 skipped.append(f"Previous Information Certificate date for machine {index + 1} (control not found)")
+            if any(f"Previous Information {name} {index + 1}" not in filled
+                   for name in ("Application number", "Certificate number", "Certificate date")):
+                return
 
     def _select_first_available(self, control):
         try:
@@ -2808,7 +2911,7 @@ class PortalWorker(threading.Thread):
 
         grouped_rows = [group.get("machines", []) for group in groups]
         flat_rows = [row for group in grouped_rows for row in group]
-        flat_row_indices = {id(row): index for index, row in enumerate(flat_rows)}
+        flat_row_indices = {id(row): index for index, row in enumerate(machines)}
         def data_rows_for(table):
             rows = table.locator("tr").all()
             return [row for row in rows if row.locator("input,select,textarea").count()]
@@ -2894,7 +2997,8 @@ class PortalWorker(threading.Thread):
         if len(tables) == 1:
             table, headers, data_rows = tables[0]
             for row_idx, row_locator in enumerate(data_rows[:len(flat_rows)]):
-                found = fill_row(row_locator, headers, flat_rows[row_idx], row_idx)
+                source_index = flat_row_indices.get(id(flat_rows[row_idx]), row_idx)
+                found = fill_row(row_locator, headers, flat_rows[row_idx], source_index)
                 for key in pattern_map:
                     if flat_rows[row_idx].get(key) and key not in found:
                         skipped.append(f"Machine {row_idx + 1} {key}")
@@ -3201,8 +3305,10 @@ class PortalWorker(threading.Thread):
                         )
                         return {
                             "street": street_label,
-                            # A literal hyphen in the Locality slot means the certificate has no numbered door; the portal still requires the submitted value to be "-".
-                        "door_number": ", ".join(prefix[:start]) or (prefix[0] if prefix and prefix[0] == "-" else ""),
+                    # A literal hyphen in the Locality slot means the
+                    # certificate has no numbered door; the portal still
+                    # requires the submitted value to be "-".
+                    "door_number": ", ".join(prefix[:start]) or (prefix[0] if prefix and prefix[0] == "-" else ""),
                         }
                     if signature != last_signature:
                         last_signature = signature
@@ -4052,6 +4158,9 @@ class App(tk.Tk):
             if index < len(self.machine_metadata):
                 item.update(self.machine_metadata[index])
             machine_rows.append(item)
+        # Preserve certificate order independently of the item grouping used
+        # for the portal's machine tables. Each row carries its own page CV.
+        machine_rows.sort(key=lambda row: int(row.get("Source PDF page", 0)))
         grouped = {}
         for row in machine_rows:
             description = row.get("Instrument description", "")
