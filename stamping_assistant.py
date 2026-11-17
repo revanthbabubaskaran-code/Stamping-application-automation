@@ -2491,13 +2491,13 @@ class PortalWorker(threading.Thread):
         previous_scope = self._repeater_section_scope(r"Previous\s+Information", "select:visible")
         app_pattern = r"(?:application|app)\s*(?:number|no\b|num\b)"
         cv_pattern = r"(?:certificate|previous\s*cv|cv)\s*(?:number|no\b)"
-        model_pattern = r"\\bmodel\\s*(?:name)?\\b"
+        model_pattern = r"\bmodel\s*(?:name)?\b"
 
         def previous_value_controls(pattern):
             """Find Previous Information inputs by label, irrespective of repeater nesting."""
             heading_top = float("-inf")
             try:
-                headings = self._section_headings(r"Previous\\s+Information")
+                headings = self._section_headings(r"Previous\s+Information")
                 if headings:
                     heading_top = min(float(item.evaluate("el => el.getBoundingClientRect().top")) for item in headings)
             except Exception:
