@@ -2494,24 +2494,30 @@ class PortalWorker(threading.Thread):
         model_pattern = r"\bmodel\s*(?:name)?\b"
 
         def previous_value_controls(pattern):
-            """Find Previous Information inputs by label, irrespective of repeater nesting."""
-            heading_top = float("-inf")
-            try:
-                headings = self._section_headings(r"Previous\s+Information")
-                if headings:
-                    heading_top = min(float(item.evaluate("el => el.getBoundingClientRect().top")) for item in headings)
-            except Exception:
-                pass
+            """Find repeated inputs even when the portal renders labels as plain text."""
             matches = self._controls_matching(page, pattern)
-            result = []
-            for control in matches:
+            if matches:
+                return sorted(matches, key=lambda control: float(control.evaluate("el => el.getBoundingClientRect().top")))
+
+            # Older portal markup sometimes places the visible field caption in
+            # a generic span/div rather than a label. Resolve that caption to
+            # its nearest input, scoped to the Previous Information section.
+            section = self._section_locator(r"Previous\\s+Information")
+            labels = section.locator("label,.control-label,[class*=label],span,div,td,th").all()
+            # Include generic text nodes too; some portal revisions do not give
+            # their visible captions a label-related class.
+            labels.extend(section.locator("*").all())
+            for label in labels:
                 try:
-                    box = control.bounding_box()
-                    if box and box["y"] >= heading_top - 4:
-                        result.append(control)
+                    text = re.sub(r"\\s+", " ", label.inner_text(timeout=300)).strip()
+                    if not text or len(text) > 80 or not re.search(pattern, text, re.I):
+                        continue
+                    control = self._control_near_label(label, section, "input:not([type='hidden']),textarea")
+                    if control is not None and all(existing != control for existing in matches):
+                        matches.append(control)
                 except Exception:
                     continue
-            return result
+            return sorted(matches, key=lambda control: float(control.evaluate("el => el.getBoundingClientRect().top")))
         def online_controls():
             controls = []
             for control in previous_scope.locator("select:visible").all():
@@ -3195,7 +3201,7 @@ class PortalWorker(threading.Thread):
                         )
                         return {
                             "street": street_label,
-                            "door_number": ", ".join(prefix[:start]),
+                            # A literal hyphen in the Locality slot means the certificate has no numbered door; the portal still requires the submitted value to be "-".\n                        "door_number": ", ".join(prefix[:start]) or (prefix[0] if prefix and prefix[0] == "-" else ""),
                         }
                     if signature != last_signature:
                         last_signature = signature
