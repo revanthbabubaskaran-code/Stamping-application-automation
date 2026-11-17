@@ -2502,14 +2502,14 @@ class PortalWorker(threading.Thread):
             # Older portal markup sometimes places the visible field caption in
             # a generic span/div rather than a label. Resolve that caption to
             # its nearest input, scoped to the Previous Information section.
-            section = self._section_locator(r"Previous\\s+Information")
+            section = self._section_locator(r"Previous\s+Information")
             labels = section.locator("label,.control-label,[class*=label],span,div,td,th").all()
             # Include generic text nodes too; some portal revisions do not give
             # their visible captions a label-related class.
             labels.extend(section.locator("*").all())
             for label in labels:
                 try:
-                    text = re.sub(r"\\s+", " ", label.inner_text(timeout=300)).strip()
+                    text = re.sub(r"\s+", " ", label.inner_text(timeout=300)).strip()
                     if not text or len(text) > 80 or not re.search(pattern, text, re.I):
                         continue
                     control = self._control_near_label(label, section, "input:not([type='hidden']),textarea")
