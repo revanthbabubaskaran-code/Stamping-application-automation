@@ -2630,11 +2630,30 @@ class PortalWorker(threading.Thread):
         def model_controls():
             return self._controls_matching(previous_scope, model_pattern)
 
+        def previous_add_button():
+            """Choose the Add beside Previous Information, not another repeater's Add."""
+            candidates = []
+            for control in previous_scope.locator("button,a,[role='button'],input[type='button']").all():
+                try:
+                    if not control.is_visible():
+                        continue
+                    label = " ".join(filter(None, [control.inner_text(timeout=500), control.get_attribute("value"), control.get_attribute("aria-label"), control.get_attribute("title")]))
+                    if not re.fullmatch(r"\s*(?:\+\s*)?(?:add|add more|add another|add new|add row)\s*", label, re.I):
+                        continue
+                    top = float(control.evaluate("el => el.getBoundingClientRect().top"))
+                    states_now = online_controls()
+                    anchor = float(states_now[-1].evaluate("el => el.getBoundingClientRect().top")) if states_now else top
+                    candidates.append((abs(top - anchor), control))
+                except Exception:
+                    continue
+            return min(candidates, key=lambda item: item[0])[1] if candidates else None
+
         def previous_row_count():
-            # The portal keeps one Delete button for every added row. Count by
-            # those row controls so an unfinished row containing both a Model
-            # Name and Online select is never counted twice.
-            return 1 + len(delete_buttons())
+            # A new row may appear first as Model Name or directly as Online.
+            # Count its current state once; use Delete buttons as a secondary
+            # signal where the portal has already created them.
+            visible_rows = len(online_controls()) + len(model_controls())
+            return max(visible_rows, 1 + len(delete_buttons()))
 
         def delete_buttons():
             buttons = []
@@ -2715,48 +2734,54 @@ class PortalWorker(threading.Thread):
         # filling happens after all rows exist; certificate date lookups can
         # then finish without delaying the next Add click.
         while current_rows < desired_rows:
-            add = self._add_button(previous_scope)
+            add = previous_add_button()
             if add is None:
                 skipped.append(f"Previous Information: Add control not found; portal has {current_rows} rows, needs {desired_rows}")
                 return
             try:
                 before_models = len(model_controls())
+                before_states = len(online_controls())
                 add.click()
-                # The portal initially creates a Model Name select. Wait only
-                # for that new control, then select this machine's exact item.
-                model_deadline = time.monotonic() + 0.9
+                # Poll promptly but allow the portal's dependent-row request
+                # to finish. Some sessions take longer than one second even
+                # though the automation adds no intentional pause.
+                model_deadline = time.monotonic() + 10
                 model_control = None
+                row_ready = False
                 while time.monotonic() < model_deadline:
                     models = model_controls()
                     if len(models) > before_models:
                         model_control = models[-1]
                         break
-                    page.wait_for_timeout(25)
-                if model_control is None:
-                    skipped.append("Previous Information: new row did not appear within 1 second of Add")
-                    return
-                model_value = machines[current_rows].get("Instrument description", "")
-                selected_model = False
-                model_control.click()
-                for option in model_control.locator("option").all():
-                    if (model_value and self._norm(option.inner_text()) == self._norm(model_value)
-                            and not option.evaluate("el => el.disabled")
-                            and str(option.evaluate("el => el.value") or "")):
-                        selected_model = self._choose_select_option(model_control, option.evaluate("el => el.value"))
-                        break
-                if not selected_model:
-                    skipped.append(f"Previous Information Model for machine {current_rows + 1} (item option not available: {model_value})")
-                    return
-                state_deadline = time.monotonic() + 0.9
-                while time.monotonic() < state_deadline:
-                    states = online_controls()
-                    if len(states) > current_rows:
-                        current_rows += 1
+                    if len(online_controls()) > before_states:
+                        row_ready = True
                         break
                     page.wait_for_timeout(25)
-                else:
-                    skipped.append("Previous Information: new Online row did not load within 1 second of model selection")
+                if model_control is None and not row_ready:
+                    skipped.append("Previous Information: Add was clicked, but the new row did not appear after waiting for the portal")
                     return
+                if model_control is not None:
+                    model_value = machines[current_rows].get("Instrument description", "")
+                    selected_model = False
+                    model_control.click()
+                    for option in model_control.locator("option").all():
+                        if (model_value and self._norm(option.inner_text()) == self._norm(model_value)
+                                and not option.evaluate("el => el.disabled")
+                                and str(option.evaluate("el => el.value") or "")):
+                            selected_model = self._choose_select_option(model_control, option.evaluate("el => el.value"))
+                            break
+                    if not selected_model:
+                        skipped.append(f"Previous Information Model for machine {current_rows + 1} (item option not available: {model_value})")
+                        return
+                    state_deadline = time.monotonic() + 10
+                    while time.monotonic() < state_deadline:
+                        if len(online_controls()) > before_states:
+                            break
+                        page.wait_for_timeout(25)
+                    else:
+                        skipped.append("Previous Information: model was selected, but its Online row did not load")
+                        return
+                current_rows += 1
                 filled.append(f"Previous Information Model {current_rows}")
             except Exception as exc:
                 skipped.append(f"Previous Information: could not create row {current_rows + 1}: {exc}")
@@ -2765,7 +2790,7 @@ class PortalWorker(threading.Thread):
         for index, machine in enumerate(machines):
             current_rows = previous_row_count()
             while current_rows < index + 1:
-                add = self._add_button(previous_scope)
+                add = previous_add_button()
                 if add is None:
                     skipped.append(f"Previous Information: Add control not found; portal has {current_rows} rows, needs {desired_rows}")
                     break
