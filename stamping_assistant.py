@@ -2491,7 +2491,27 @@ class PortalWorker(threading.Thread):
         previous_scope = self._repeater_section_scope(r"Previous\s+Information", "select:visible")
         app_pattern = r"(?:application|app)\s*(?:number|no\b|num\b)"
         cv_pattern = r"(?:certificate|previous\s*cv|cv)\s*(?:number|no\b)"
-        model_pattern = r"\bmodel\s*(?:name)?\b"
+        model_pattern = r"\\bmodel\\s*(?:name)?\\b"
+
+        def previous_value_controls(pattern):
+            """Find Previous Information inputs by label, irrespective of repeater nesting."""
+            heading_top = float("-inf")
+            try:
+                headings = self._section_headings(r"Previous\\s+Information")
+                if headings:
+                    heading_top = min(float(item.evaluate("el => el.getBoundingClientRect().top")) for item in headings)
+            except Exception:
+                pass
+            matches = self._controls_matching(page, pattern)
+            result = []
+            for control in matches:
+                try:
+                    box = control.bounding_box()
+                    if box and box["y"] >= heading_top - 4:
+                        result.append(control)
+                except Exception:
+                    continue
+            return result
         def online_controls():
             controls = []
             for control in previous_scope.locator("select:visible").all():
@@ -2647,8 +2667,8 @@ class PortalWorker(threading.Thread):
                 skipped.append(f"Previous Information Online option for machine {index + 1}")
                 continue
             filled.append(f"Previous Information Online {index + 1}")
-            apps = wait_for_count(lambda: self._controls_matching(previous_scope, app_pattern), index + 1)
-            cvs = wait_for_count(lambda: self._controls_matching(previous_scope, cv_pattern), index + 1)
+            apps = wait_for_count(lambda: previous_value_controls(app_pattern), index + 1)
+            cvs = wait_for_count(lambda: previous_value_controls(cv_pattern), index + 1)
             app_no = machine.get("Application number", "") or shared_application_number
             cv_no = machine.get("Previous CV number", "")
             row_value_controls = []
@@ -2705,7 +2725,7 @@ class PortalWorker(threading.Thread):
                     skipped.append(f"Previous Information {label} for machine {index + 1}: {exc}")
 
             # Certificate date is computed by the portal after both identifiers.
-            dates = self._controls_matching(previous_scope, r"certificate\s*date|previous\s*cv\s*date")
+            dates = previous_value_controls(r"certificate\s*date|previous\s*cv\s*date")
             if index < len(dates):
                 deadline = time.monotonic() + 30
                 refreshed_identifiers = False
