@@ -500,7 +500,7 @@ class PortalWorker(threading.Thread):
                                 self.messages.put(("error", "The portal did not reach a page with a visible Submit control. Review the fields reported as skipped, then use Fill now / retry; nothing was submitted."))
                             else:
                                 self.ready_for_submit = True
-                                self._submit()
+                                self.messages.put(("ready_to_submit", "The form reached final review. Check it in Chromium, then choose Submit application in the assistant when ready."))
                         except Exception as e:
                             self.messages.put(("error", f"Login was detected, but the automatic form steps stopped safely: {e}"))
                     continue
@@ -535,7 +535,7 @@ class PortalWorker(threading.Thread):
                                 self.messages.put(("error", "The portal did not reach a page with a visible Submit control. Review the fields reported as skipped, then use Fill now / retry; nothing was submitted."))
                             else:
                                 self.ready_for_submit = True
-                                self._submit()
+                                self.messages.put(("ready_to_submit", "The form reached final review. Check it in Chromium, then choose Submit application in the assistant when ready."))
                     elif cmd == "submit":
                         self._submit()
                     elif cmd == "credentials":
@@ -964,11 +964,38 @@ class PortalWorker(threading.Thread):
         compact = lambda value: re.sub(r"[^a-z0-9]", "", value.lower())
         return bool(actual) and compact(actual) == compact(expected)
 
+    def _detect_current_workflow_step(self):
+        """Use the visible portal page so retry resumes where the user is."""
+        page = self.page
+        try:
+            if not self._logged_in():
+                return None
+            body = self._norm(page.locator("body").inner_text(timeout=1500))
+            if (self._find_visible_submit() is not None and self._find_visible_edit() is not None
+                    and ("previous verification certificate information" in body or "stamping confirmation" in body)):
+                return 3
+            for table in page.locator("table:visible").all():
+                headers = self._norm(" ".join(table.locator("tr").all_inner_texts()[:3]))
+                if ("machine no" in headers or "machine number" in headers) and table.locator("input:visible,select:visible").count():
+                    return 2
+            if page.locator("#Stamping:visible").count() or page.locator("#newgood:visible").count():
+                return 1
+            if re.search(r"establishment details|previous information", body):
+                return 1
+        except Exception:
+            pass
+        return None
+
     def _fill_form(self, payload):
-        if self.workflow_step < 2:
-            self._navigate_to_stamping_form()
-        elif not self._logged_in():
+        if not self._logged_in():
             raise RuntimeError("The portal session is no longer signed in. Log in again before continuing the machine details review.")
+        current_step = self._detect_current_workflow_step()
+        if current_step is not None:
+            self.workflow_step = current_step
+        elif self.workflow_step < 2:
+            self._navigate_to_stamping_form()
+        else:
+            raise RuntimeError("Could not identify the current portal step. Leave the page open and retry so the assistant can resume without navigating away.")
         self.ready_for_submit = False
         if self.workflow_step <= 0:
             self.final_edit_retry_used = False
@@ -3722,6 +3749,19 @@ class App(tk.Tk):
 
         first_page = self._card(body, "Application review — applicant and first page")
         ttk.Button(first_page, text="Read PDF and fill draft", command=self.read_pdf, style="Primary.TButton").pack(anchor="w", pady=(8, 6))
+        choice_row = ttk.Frame(first_page, style="Card.TFrame")
+        choice_row.pack(fill="x", pady=(4, 8))
+        self.stamping_place_var = tk.StringVar(value="Select")
+        self.site_status_var = tk.StringVar(value="Select")
+        ttk.Label(choice_row, text="Stamping Office or Site", style="Card.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.stamping_place_combo = ttk.Combobox(choice_row, textvariable=self.stamping_place_var, values=("Select", "Office", "Site"), state="readonly", width=16)
+        self.stamping_place_combo.grid(row=0, column=1, sticky="w", padx=(0, 18))
+        ttk.Label(choice_row, text="Site Dormant / Other", style="Card.TLabel").grid(row=0, column=2, sticky="w", padx=(0, 8))
+        self.site_status_combo = ttk.Combobox(choice_row, textvariable=self.site_status_var, values=("Select", "Dormant", "Other"), state="disabled", width=16)
+        self.site_status_combo.grid(row=0, column=3, sticky="w")
+        choice_row.columnconfigure(4, weight=1)
+        self.stamping_place_combo.bind("<<ComboboxSelected>>", self._on_application_choice_changed)
+        self.site_status_combo.bind("<<ComboboxSelected>>", self._on_application_choice_changed)
         self.first_page_field_frame = ttk.Frame(first_page, style="Card.TFrame")
         self.first_page_field_frame.pack(fill="x")
 
@@ -3738,6 +3778,10 @@ class App(tk.Tk):
         self._set_fields({})
 
         action = ttk.Frame(body, style="Card.TFrame", padding=14); action.pack(fill="x", pady=(12, 5))
+        self.draft_confirmed = tk.BooleanVar(value=False)
+        self.draft_confirmation_status = tk.StringVar(value="Review the PDF draft and confirm before starting.")
+        ttk.Button(action, text="Confirm draft is ready", command=self.confirm_draft).pack(side="left", padx=(0, 8))
+        ttk.Label(action, textvariable=self.draft_confirmation_status, style="Muted.Card.TLabel").pack(side="left", padx=(4, 12))
         ttk.Button(action, text="Start application", command=self.open_portal, style="Primary.TButton").pack(side="left", padx=(0, 8))
         ttk.Button(action, text="Fill now / retry", command=self.fill_application).pack(side="left", padx=8)
         ttk.Button(action, text="Submit application", command=self.submit_application).pack(side="left", padx=8)
@@ -3770,6 +3814,20 @@ class App(tk.Tk):
         self.vars.clear()
         self.machine_rows = []
         self.machine_metadata = []
+        if hasattr(self, "draft_confirmed"):
+            self.draft_confirmed.set(False)
+            if hasattr(self, "draft_confirmation_status"):
+                self.draft_confirmation_status.set("PDF draft changed; confirm it again before starting.")
+        if hasattr(self, "stamping_place_var"):
+            # Keep the user's explicit choice across PDF rereads, but offer the
+            # certificate value as the initial choice when nothing is selected.
+            if self.stamping_place_var.get() not in {"Office", "Site"}:
+                detected = str(values.get("Stamping office/site", "")).strip().title()
+                self.stamping_place_var.set(detected if detected in {"Office", "Site"} else "Select")
+            if self.site_status_var.get() not in {"Dormant", "Other"}:
+                detected = str(values.get("Dormant / Other", "")).strip().title()
+                self.site_status_var.set(detected if detected in {"Dormant", "Other"} else "Select")
+            self._sync_site_choice()
         first_idx = 0
         machine_keys = [
             "Weights", "Instrument description", "Instrument make", "Maximum capacity", "Minimum capacity",
@@ -4088,6 +4146,8 @@ class App(tk.Tk):
             return
         self._ensure_worker()
         has_draft = bool(self.machine_rows and self.files.get("certificate"))
+        if has_draft and not self._validate_draft_confirmation():
+            return
         try:
             self.worker.send("open", {"credentials": {"username": self.user_var.get(), "password": self.pass_var.get()}, "application": self._application_payload() if has_draft else None})
             self.status.set("Opening bundled Chromium and filling saved sign-in. Enter the CAPTCHA in that window; a reviewed PDF draft will continue automatically after login." if has_draft else "Opening bundled Chromium and filling saved sign-in. Enter the CAPTCHA there. Read the PDF draft, then choose Fill now / retry after login.")
@@ -4106,6 +4166,8 @@ class App(tk.Tk):
         if not self.files.get("certificate") or not self.machine_rows:
             messagebox.showerror("PDF draft required", "Choose the previous CV PDF and select Read PDF and fill draft first.")
             return
+        if not self._validate_draft_confirmation():
+            return
         if hasattr(self, "previous_info_status"):
             self.previous_info_status.set("Checking Previous Information fields…")
         self._ensure_worker()
@@ -4120,6 +4182,8 @@ class App(tk.Tk):
 
     def _application_payload(self):
         fields = {k: v.get().strip() for k, v in self.vars.items()}
+        fields["Stamping office/site"] = self.stamping_place_var.get().strip()
+        fields["Dormant / Other"] = self.site_status_var.get().strip() if fields["Stamping office/site"].casefold() == "site" else ""
         # The portal's establishment name is the company name parsed/reviewed
         # from the certificate. PAN identity and repairer identity are separate.
         # The PDF's M/S line is the source of truth for the establishment
@@ -4183,6 +4247,51 @@ class App(tk.Tk):
             return
         self.worker.send("submit")
         self.status.set("Submitting the reviewed application. No payment will be made.")
+
+    def _sync_site_choice(self):
+        if not hasattr(self, "site_status_combo"):
+            return
+        is_site = self.stamping_place_var.get().strip().casefold() == "site"
+        self.site_status_combo.configure(state="readonly" if is_site else "disabled")
+        if not is_site:
+            self.site_status_var.set("Select")
+
+    def _on_application_choice_changed(self, _event=None):
+        self.draft_confirmed.set(False)
+        self.draft_confirmation_status.set("Choices changed; confirm the draft again.")
+        self._sync_site_choice()
+
+    def confirm_draft(self):
+        if not self.files.get("certificate") or not self.machine_rows:
+            messagebox.showerror("Read the PDF first", "Choose the certificate, then select Read PDF and fill draft before confirming.")
+            return
+        place = self.stamping_place_var.get().strip().casefold()
+        if place not in {"office", "site"}:
+            messagebox.showerror("Choose Office or Site", "Select whether this application is for Office or Site stamping before confirming the draft.")
+            return
+        if place == "site" and self.site_status_var.get().strip().casefold() not in {"dormant", "other"}:
+            messagebox.showerror("Choose Dormant or Other", "For Site stamping, select Dormant or Other before confirming the draft.")
+            return
+        if not messagebox.askyesno("Confirm application draft", "Have you reviewed the PDF values, machine details, stamping location, and site Dormant/Other choice? Confirm only when the draft is ready to fill the portal."):
+            return
+        self.draft_confirmed.set(True)
+        self.draft_confirmation_status.set("Draft confirmed. You can start or resume filling.")
+
+    def _validate_draft_confirmation(self, show_error=True):
+        if not self.draft_confirmed.get():
+            if show_error:
+                messagebox.showerror("Confirm the draft first", "Review the PDF values and select the confirmation box before starting or filling the application.")
+            return False
+        place = self.stamping_place_var.get().strip().casefold()
+        if place not in {"office", "site"}:
+            if show_error:
+                messagebox.showerror("Choose Office or Site", "Select whether this application is for Office or Site stamping before confirming the draft.")
+            return False
+        if place == "site" and self.site_status_var.get().strip().casefold() not in {"dormant", "other"}:
+            if show_error:
+                messagebox.showerror("Choose Dormant or Other", "For Site stamping, select Dormant or Other before confirming the draft.")
+            return False
+        return True
 
     def _poll(self):
         try:
