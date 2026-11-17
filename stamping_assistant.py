@@ -2608,7 +2608,7 @@ class PortalWorker(threading.Thread):
             return None
 
         def wait_for_row_inputs(state_control):
-            deadline = time.monotonic() + 12
+            deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
                 result = row_inputs(state_control)
                 if result is not None:
@@ -2710,7 +2710,7 @@ class PortalWorker(threading.Thread):
                 break
             try:
                 removes[-1].click()
-                deadline = time.monotonic() + 8
+                deadline = time.monotonic() + 5
                 while time.monotonic() < deadline:
                     updated = previous_row_count()
                     if updated < current_rows:
@@ -2745,7 +2745,7 @@ class PortalWorker(threading.Thread):
                 # Poll promptly but allow the portal's dependent-row request
                 # to finish. Some sessions take longer than one second even
                 # though the automation adds no intentional pause.
-                model_deadline = time.monotonic() + 10
+                model_deadline = time.monotonic() + 5
                 model_control = None
                 row_ready = False
                 while time.monotonic() < model_deadline:
@@ -2773,7 +2773,7 @@ class PortalWorker(threading.Thread):
                     if not selected_model:
                         skipped.append(f"Previous Information Model for machine {current_rows + 1} (item option not available: {model_value})")
                         return
-                    state_deadline = time.monotonic() + 10
+                    state_deadline = time.monotonic() + 5
                     while time.monotonic() < state_deadline:
                         if len(online_controls()) > before_states:
                             break
@@ -2796,7 +2796,7 @@ class PortalWorker(threading.Thread):
                     break
                 try:
                     add.click()
-                    deadline = time.monotonic() + 8
+                    deadline = time.monotonic() + 5
                     while time.monotonic() < deadline:
                         updated = previous_row_count()
                         if updated > current_rows:
@@ -2835,7 +2835,7 @@ class PortalWorker(threading.Thread):
                     except Exception:
                         selected_model = False
                     if selected_model:
-                        deadline = time.monotonic() + 8
+                        deadline = time.monotonic() + 5
                         while time.monotonic() < deadline:
                             models = model_controls()
                             states = online_controls()
@@ -2880,7 +2880,7 @@ class PortalWorker(threading.Thread):
                     if persisted:
                         filled.append(f"Previous Information {label} {index + 1}")
                         continue
-                    ready_deadline = time.monotonic() + 15
+                    ready_deadline = time.monotonic() + 5
                     while time.monotonic() < ready_deadline:
                         try:
                             if control.is_visible() and control.is_enabled() and control.is_editable():
@@ -2923,7 +2923,7 @@ class PortalWorker(threading.Thread):
             # Certificate date is computed by the portal after both identifiers.
             dates = [None] * index + [date_control]
             if index < len(dates):
-                deadline = time.monotonic() + 30
+                deadline = time.monotonic() + 5
                 refreshed_identifiers = False
                 while time.monotonic() < deadline:
                     try:
