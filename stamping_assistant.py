@@ -860,6 +860,11 @@ class PortalWorker(threading.Thread):
         """Prefer a visible known ID, then fall back to the portal's visible label."""
         selectors = ([PORTAL_IDS[field]] if field in PORTAL_IDS else []) + list(PORTAL_ID_ALIASES.get(field, ()))
         for selector in selectors:
+            if field == "Repairer licence number":
+                # The live form exposes the repairer license input by its
+                # country-specific placeholder; some portal revisions reuse
+                # the legacy `licence-no` id for another readonly control.
+                break
             direct = self.page.locator(selector)
             try:
                 if direct.count() and direct.first.is_visible():
@@ -867,10 +872,10 @@ class PortalWorker(threading.Thread):
             except Exception:
                 pass
         if field == "Repairer licence number":
-            for selector in ('input[placeholder*="TN/"]:visible', 'input[name*="licen" i]:visible', 'input[id*="licen" i]:visible'):
+            for selector in ('input[placeholder*="TN/" i]:visible', 'input[name*="licen" i]:visible', 'input[id*="licen" i]:visible'):
                 direct = self.page.locator(selector)
                 try:
-                    if direct.count() == 1:
+                    if direct.count() == 1 and direct.first.is_enabled() and direct.first.is_editable():
                         return direct.first
                 except Exception:
                     pass
@@ -973,6 +978,12 @@ class PortalWorker(threading.Thread):
 
         if self.workflow_step <= 0:
             self._fill_establishment_page(fields, machines, payload, report)
+            # The first-page controls must be completed in sequence before the
+            # app touches Items or Previous Information lower on that page.
+            # Returning here also makes Fill now / retry resume at the first
+            # missing field instead of racing ahead and replaying later rows.
+            if report["required_blank"]:
+                return report
         if self.workflow_step <= 1:
             # Items and Previous Information are lower sections on this same
             # first portal page. Fill them before validating or clicking Next.
@@ -1400,17 +1411,13 @@ class PortalWorker(threading.Thread):
                 if locator is None or not locator.count() or not locator.first.is_visible():
                     # Some controls are inserted only after the preceding
                     # stamping choices are made. Re-resolve them after the
-                    # top-to-bottom pass rather than permanently skipping them.
+                    # preceding entries have loaded. Keep a placeholder in the
+                    # ordered queue so later fields cannot leapfrog it.
                     deferred_actions.append((field, None, value))
                     continue
                 # Dependent controls (licence number, address dropdowns and
                 # invoice fields) can be disabled until earlier choices load.
                 # Keep them in the top-to-bottom queue and recheck at fill time.
-                portal_populates = {"Registered name", "Registered email", "Registered mobile",
-                                    "Repairer licence date", "Licensed valid Up To"}
-                if not locator.first.is_editable() and field in portal_populates:
-                    deferred_actions.append((field, locator.first, value))
-                    continue
                 top = locator.first.evaluate("el => el.getBoundingClientRect().top")
                 actions.append((float(top), field, locator.first, value, "field"))
             except Exception as exc:
@@ -1554,6 +1561,12 @@ class PortalWorker(threading.Thread):
             "PAN number", "PAN date", "Upload copy of PAN card",
         ]
         order_index = {name: index for index, name in enumerate(ordered_fields)}
+        # Preserve the requested field sequence as the primary sort key.
+        # Screen geometry is only used to resolve fields that share an entry.
+        for field, locator, value in deferred_actions:
+            if locator is None:
+                actions.append((0.0, field, None, value, "field"))
+        deferred_actions = [(field, locator, value) for field, locator, value in deferred_actions if locator is not None]
         row_tops = []
         for row_top in sorted(float(action[0]) for action in actions):
             if not row_tops or row_top - row_tops[-1] > 14:
@@ -1561,6 +1574,9 @@ class PortalWorker(threading.Thread):
 
         def action_order(action):
             top, name, locator = action[0], action[1], action[2]
+            sequence = order_index.get(name, len(order_index))
+            if locator is None:
+                return (sequence, float("inf"), 0.0)
             # Cluster nearby control tops into a visual row, then order that
             # row by x. This keeps label/control alignment differences from
             # moving a right-hand field ahead of the left cell in the same row.
@@ -1575,10 +1591,10 @@ class PortalWorker(threading.Thread):
                     return host ? host.getBoundingClientRect().left : Number.POSITIVE_INFINITY;
                 }""")
                 if left is not None:
-                    return (row_key, float(left), order_index.get(name, len(order_index)))
+                    return (sequence, row_key, float(left))
             except Exception:
                 pass
-            return (row_key, float("inf"), order_index.get(name, len(order_index)))
+            return (sequence, row_key, float("inf"))
 
         def select_location(field, locator, value):
             if field.startswith("Manufacturer "):
@@ -1689,6 +1705,42 @@ class PortalWorker(threading.Thread):
         pending_actions = sorted(actions, key=action_order)
         while pending_actions:
             _top, field, locator, value, action_type = pending_actions.pop(0)
+            if locator is None:
+                try:
+                    if field == "Manufacturer / Trader establishment name":
+                        locator = self._field_in_section(r"Manufacturer\s*/\s*Trader\s*/\s*Establishment", r"establishment\s*name")
+                    elif field == "Repaired by / Used by":
+                        locator = page.locator("#trader-name")
+                        if not locator.count() or not locator.is_visible():
+                            locator = self._field_in_section(r"Manufacturer\s*/\s*Trader\s*/\s*Establishment", r"repaired\s*by\s*/?\s*used\s*by")
+                    elif field.startswith("Manufacturer "):
+                        original = field.removeprefix("Manufacturer ")
+                        pattern = manufacturer_address_fields.get(original)
+                        locator = self._field_in_section(
+                            r"Manufacturer\s*/\s*Trader\s*/\s*Establishment", pattern,
+                            "input" if original in {"Door number", "Pincode"} else None,
+                        ) if pattern else None
+                    else:
+                        locator = establishment_control(field) or self._portal_field(field)
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline and (locator is None or not locator.count() or not locator.first.is_visible()):
+                        page.wait_for_timeout(100)
+                        if field.startswith("Manufacturer "):
+                            original = field.removeprefix("Manufacturer ")
+                            pattern = manufacturer_address_fields.get(original)
+                            locator = self._field_in_section(
+                                r"Manufacturer\s*/\s*Trader\s*/\s*Establishment", pattern,
+                                "input" if original in {"Door number", "Pincode"} else None,
+                            ) if pattern else None
+                        else:
+                            locator = establishment_control(field) or self._portal_field(field)
+                    if locator is None or not locator.count() or not locator.first.is_visible():
+                        report["skipped"].append(f"{field} (control still unavailable at its sequence position)")
+                        break
+                    locator = locator.first
+                except Exception as exc:
+                    report["skipped"].append(f"{field} (control lookup failed at its sequence position: {exc})")
+                    break
             if field in {"Street", "Manufacturer Street"}:
                 value = fields.get("Street", value)
             elif field in {"Door number", "Manufacturer Door number"}:
@@ -1727,6 +1779,16 @@ class PortalWorker(threading.Thread):
                     if field not in report["filled"]:
                         report["filled"].append(field)
                     continue
+                if field in {"Registered name", "Registered email", "Registered mobile",
+                             "Repairer licence date", "Licensed valid Up To"}:
+                    deadline = time.monotonic() + 20
+                    while time.monotonic() < deadline and not self._field_value_matches(locator, value):
+                        page.wait_for_timeout(150)
+                    if self._field_value_matches(locator, value):
+                        report["filled"].append(field)
+                        continue
+                    report["skipped"].append(f"{field} (portal has not populated the expected value yet)")
+                    break
                 if action_type == "license-establishment":
                     value = str(value or fields.get("Used by / trader contact", "")).strip()
                     if not value:
@@ -1763,21 +1825,18 @@ class PortalWorker(threading.Thread):
                             if field not in report["filled"]:
                                 report["filled"].append(field)
                             continue
-                        deferred_actions.append((field, locator, value))
-                        continue
+                        report["skipped"].append(f"{field} (still disabled at its sequence position)")
+                        break
                 if locator.evaluate("el => el.tagName.toLowerCase()") == "select":
                     selected = select_location(field, locator, value)
                     if not selected:
-                        if field in {"District", "Taluk", "Town / Village", "Street", "Weighing machine capacity range"}:
-                            deferred_actions.append((field, locator, value))
-                            continue
                         report["skipped"].append(f"{field} (no matching enabled option for {value})")
-                        continue
+                        break
                     if field.startswith("Manufacturer ") and applicant_name:
                         self._ensure_manufacturer_company_name(applicant_name, stable_for=0.1)
                 elif not self._fill_control(locator, value):
                     report["skipped"].append(f"{field} (could not select {value})")
-                    continue
+                    break
                 # The portal inserts the site fee selector only after Site has
                 # been selected. Resolve it then, before moving further down.
                 if field == "Stamping office/site" and str(value).lower() == "site":
@@ -1809,7 +1868,7 @@ class PortalWorker(threading.Thread):
                         report["skipped"].append("Site Dormant / Other choice (control not found after selecting Site)")
                 if field in {"Repairer licence number", "Previous CV number", "Previous CV date"} and not self._field_value_matches(locator, value):
                     report["skipped"].append(f"{field} (portal value did not persist after filling)")
-                    continue
+                    break
                 report["filled"].append(field)
             except Exception as exc:
                 report["skipped"].append(f"{field}: {exc}")
@@ -1919,7 +1978,7 @@ class PortalWorker(threading.Thread):
         # AJAX-backed select before the prior dropdown's change callback has
         # populated it. Recheck in the portal's actual top-to-bottom sequence
         # and touch only values that are still missing or incorrect.
-        address_sequence = [
+        address_sequence = [] if pending_actions else [
             ("Applicant / establishment name", r"Establishment\s+Details", r"name", "Applicant / establishment name"),
             ("State", r"Establishment\s+Details", r"state", "State"),
             ("District", r"Establishment\s+Details", r"district", "District"),
@@ -1979,7 +2038,7 @@ class PortalWorker(threading.Thread):
         # Dependent address selects can refresh the Manufacturer / Trader block
         # and overwrite its Establishment Name after the earlier top-to-bottom
         # entry. Reassert the company name after those lists finish loading.
-        if applicant_name:
+        if applicant_name and not pending_actions:
             marker = "Manufacturer / Trader establishment name"
             report["filled"] = [entry for entry in report["filled"] if entry != marker]
             if self._ensure_manufacturer_company_name(applicant_name):
@@ -3914,4 +3973,88 @@ class App(tk.Tk):
         # The PDF's M/S line is the source of truth for the establishment
         # name; don't let a stale secondary entry replace it (for example with
         # the state value copied by the portal's same-details checkbox).
-        company_
+        company_name = fields.get("Applicant / establishment name", "").strip() or fields.get("Applicant business name", "").strip()
+        if company_name:
+            fields["Applicant business name"] = company_name
+            fields["Applicant / establishment name"] = company_name
+        fields["PAN name"] = fields.get("PAN name", "") or self.pan_name.get().strip()
+        fields["PAN number"] = fields.get("PAN number", "") or self.pan_number.get().strip()
+        fields["PAN date"] = fields.get("PAN date", "") or self.pan_date.get().strip()
+        fields["Repairer licence number"] = self.license_number.get().strip() or fields.get("Repairer licence number", "")
+        fields["Repairer name"] = self.pan_name.get().strip() or fields.get("Repairer name", "")
+        fields["Applicant contact name"] = fields.get("Applicant contact name", "") or self.contact_var.get().strip()
+        fields["Registered name"] = fields.get("Registered name", "") or self.contact_var.get().strip()
+        fields["Registered email"] = self.user_var.get().strip() or fields.get("Registered email", "")
+        fields["Registered mobile"] = fields.get("Registered mobile", "") or self.mobile_var.get().strip()
+        account_index = self.account_combo.current()
+        account = self.accounts[account_index] if 0 <= account_index < len(self.accounts) else {}
+        repairer_company = account.get("repairer_company_name", "").strip() or fields.get("Repairer business name", "").strip()
+        repairer_mobile = account.get("repairer_mobile", "").strip() or fields.get("Repairer mobile", "").strip()
+        repairer_contact = ", ".join(part for part in (repairer_company, repairer_mobile) if part)
+        fields["Used by / trader contact"] = repairer_contact or self.repairer_establishment_var.get().strip() or fields.get("Used by / trader contact", "")
+        image_payload = None
+        account_index = self.account_combo.current()
+        account = self.accounts[account_index] if 0 <= account_index < len(self.accounts) else {}
+        encoded = account.get("pan_image_b64")
+        if encoded:
+            image_bytes = base64.b64decode(encoded)
+            image_name = account.get("pan_image_name", "pan-card.jpg")
+            image_payload = {"name": image_name, "mimeType": mimetypes.guess_type(image_name)[0] or "image/jpeg", "buffer": image_bytes}
+        machine_rows = []
+        for index, row in enumerate(self.machine_rows):
+            item = {key: value.get().strip() for key, value in row.items()}
+            if index < len(self.machine_metadata):
+                item.update(self.machine_metadata[index])
+            machine_rows.append(item)
+        grouped = {}
+        for row in machine_rows:
+            description = row.get("Instrument description", "")
+            key = normalize_text(description)
+            if not key:
+                continue
+            group = grouped.setdefault(key, {"description": description, "quantity": 0, "machines": []})
+            group["quantity"] += _item_count(row.get("Quantity", ""))
+            group["machines"].append(row)
+        return {"fields": fields, "machine_rows": machine_rows, "item_groups": list(grouped.values()), "certificate": self.files.get("certificate"), "authorization": self.files.get("authorization"), "pan_image_data": image_payload}
+
+    def submit_application(self):
+        if not self.worker or not self.worker.is_alive():
+            messagebox.showerror("Sign in first", "Log in through the app browser and prepare the application first.")
+            return
+        if not self.worker.ready_for_submit:
+            messagebox.showerror("Finish the review pages first", "Use Start application or Fill now / retry and complete the portal pages through the final review page before submitting.")
+            return
+        if not messagebox.askyesno("Submit application", "Submit this completed application to the Tamil Nadu Labour Department?\n\nReview the portal pages first. This is the final application submission; the app will not make a payment."):
+            return
+        self.worker.send("submit")
+        self.status.set("Submitting the reviewed application. No payment will be made.")
+
+    def _poll(self):
+        try:
+            while True:
+                kind, value = self.msgq.get_nowait()
+                if kind == "error":
+                    self.status.set(value)
+                    if hasattr(self, "previous_info_status"):
+                        self.previous_info_status.set(value)
+                    self._show_copyable_error("Automation stopped", value)
+                elif kind == "details":
+                    self.status.set(f"Filled: {', '.join(value['filled']) or 'none'}. Uploaded: {', '.join(value['uploaded']) or 'none'}. Needs manual review: {', '.join(value['skipped']) or 'no unmatched fields reported'}.")
+                elif kind == "payment":
+                    self.status.set(value)
+                elif kind == "submitted":
+                    self.status.set(value)
+                elif kind == "login_ok":
+                    self.status.set("Sign-in complete.")
+                elif kind == "login_failed":
+                    self.status.set(value); self._show_copyable_error("Sign-in failed", value)
+                elif kind == "ready_to_submit":
+                    self.status.set(value)
+                else:
+                    self.status.set(value)
+        except queue.Empty: pass
+        self.after(250, self._poll)
+
+
+if __name__ == "__main__":
+    App().mainloop()
