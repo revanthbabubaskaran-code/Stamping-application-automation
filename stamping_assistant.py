@@ -1283,7 +1283,7 @@ class PortalWorker(threading.Thread):
             "State": r"state",
             "District": r"district",
             "Taluk": r"taluk",
-            "Town / Village": r"town\s+village",
+            "Town / Village": r"town\s*/?\s*village",
             "Street": r"street",
             "Door number": r"door\s+number",
             "Pincode": r"pincode|pin\s+code",
@@ -1395,11 +1395,14 @@ class PortalWorker(threading.Thread):
                 return False
 
         def establishment_control(field, section_pattern=r"Establishment\s+Details"):
-            locator = None if field == "Applicant / establishment name" else self._portal_field(field)
-            if field in establishment_labels and (locator is None or field == "Applicant / establishment name"):
+            # Page-wide IDs are unsafe for duplicated address controls: the
+            # portal's #trader-state-id is the manufacturer address State.
+            # Always scope applicant address/name controls to Establishment
+            # Details so this sequence cannot jump into the second address.
+            if field in establishment_labels:
                 expected_tag = "input" if field in {"Applicant / establishment name", "Door number", "Pincode"} else None
-                locator = self._field_in_section(section_pattern, establishment_labels[field], expected_tag)
-            return locator
+                return self._field_in_section(section_pattern, establishment_labels[field], expected_tag)
+            return self._portal_field(field)
 
         for field, value in fields.items():
             if not value or field in excluded:
