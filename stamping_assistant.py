@@ -1647,11 +1647,14 @@ class PortalWorker(threading.Thread):
             "PAN number", "PAN date", "Upload copy of PAN card",
         ]
         order_index = {name: index for index, name in enumerate(ordered_fields)}
-        # Preserve the requested field sequence as the primary sort key.
-        # Screen geometry is only used to resolve fields that share an entry.
+        # Fill in visual reading order: top row to bottom row, and left to
+        # right within each row. The field list only breaks equal-position ties.
         for field, locator, value in deferred_actions:
             if locator is None:
-                actions.append((0.0, field, None, value, "field"))
+                # Unknown/conditional controls go after already visible
+                # controls; resolving one must not make it jump to the top of
+                # the page ahead of fields with known screen coordinates.
+                actions.append((float("inf"), field, None, value, "field"))
         deferred_actions = [(field, locator, value) for field, locator, value in deferred_actions if locator is not None]
         row_tops = []
         for row_top in sorted(float(action[0]) for action in actions):
@@ -1662,7 +1665,7 @@ class PortalWorker(threading.Thread):
             top, name, locator = action[0], action[1], action[2]
             sequence = order_index.get(name, len(order_index))
             if locator is None:
-                return (sequence, float("inf"), 0.0)
+                return (float(top), float("inf"), sequence)
             # Cluster nearby control tops into a visual row, then order that
             # row by x. This keeps label/control alignment differences from
             # moving a right-hand field ahead of the left cell in the same row.
@@ -1677,10 +1680,10 @@ class PortalWorker(threading.Thread):
                     return host ? host.getBoundingClientRect().left : Number.POSITIVE_INFINITY;
                 }""")
                 if left is not None:
-                    return (sequence, row_key, float(left))
+                    return (row_key, float(left), sequence)
             except Exception:
                 pass
-            return (sequence, row_key, float("inf"))
+            return (row_key, float("inf"), sequence)
 
         def select_location(field, locator, value):
             if field.startswith("Manufacturer "):
@@ -2630,6 +2633,46 @@ class PortalWorker(threading.Thread):
         def model_controls():
             return self._controls_matching(previous_scope, model_pattern)
 
+        def model_option_matches(option_label, item_label):
+            """Allow portal dash/spacing variants while preserving item type/class."""
+            option_norm = self._norm(option_label)
+            item_norm = self._norm(item_label)
+            if not option_norm or not item_norm:
+                return False
+            if option_norm == item_norm or option_norm in item_norm or item_norm in option_norm:
+                return True
+            # Electronic and mechanical instruments must never cross-match.
+            for kind in ("electronic", "mechanical"):
+                if kind in item_norm and kind not in option_norm:
+                    return False
+            item_classes = re.findall(r"\b(?:iii|iiii|iv|ii)\b", item_norm)
+            option_classes = re.findall(r"\b(?:iii|iiii|iv|ii)\b", option_norm)
+            if item_classes and not set(item_classes).issubset(set(option_classes)):
+                return False
+            item_tokens = set(item_norm.split())
+            option_tokens = set(option_norm.split())
+            overlap = len(item_tokens & option_tokens) / max(1, len(item_tokens))
+            return overlap >= 0.72 or SequenceMatcher(None, item_norm, option_norm).ratio() >= 0.72
+
+        def choose_model(control, item_label):
+            choices = []
+            try:
+                for option in control.locator("option").all():
+                    option_label = option.inner_text()
+                    value = str(option.evaluate("el => el.value") or "")
+                    if (value and not option.evaluate("el => el.disabled")
+                            and model_option_matches(option_label, item_label)):
+                        score = SequenceMatcher(None, self._norm(option_label), self._norm(item_label)).ratio()
+                        if self._norm(option_label) in self._norm(item_label) or self._norm(item_label) in self._norm(option_label):
+                            score = 1.0
+                        choices.append((score, value))
+            except Exception:
+                return False
+            if not choices:
+                return False
+            _score, value = max(choices, key=lambda item: item[0])
+            return self._choose_select_option(control, value)
+
         def previous_add_button():
             """Choose the Add beside Previous Information, not another repeater's Add."""
             candidates = []
@@ -2772,7 +2815,7 @@ class PortalWorker(threading.Thread):
                             if candidate.get_attribute("id") in online_ids:
                                 continue
                             try:
-                                if any(self._norm(option.inner_text()) == self._norm(model_value)
+                                if any(model_option_matches(option.inner_text(), model_value)
                                        and option.get_attribute("value")
                                        and not option.evaluate("el => el.disabled")
                                        for option in candidate.locator("option").all()):
@@ -2791,14 +2834,8 @@ class PortalWorker(threading.Thread):
                     return
                 if model_control is not None:
                     model_value = machines[current_rows].get("Instrument description", "")
-                    selected_model = False
                     model_control.click()
-                    for option in model_control.locator("option").all():
-                        if (model_value and self._norm(option.inner_text()) == self._norm(model_value)
-                                and not option.evaluate("el => el.disabled")
-                                and str(option.evaluate("el => el.value") or "")):
-                            selected_model = self._choose_select_option(model_control, option.evaluate("el => el.value"))
-                            break
+                    selected_model = choose_model(model_control, model_value)
                     if not selected_model:
                         skipped.append(f"Previous Information Model for machine {current_rows + 1} (item option not available: {model_value})")
                         return
@@ -2830,12 +2867,7 @@ class PortalWorker(threading.Thread):
             selected_model = False
             try:
                 model_control.click()
-                for option in model_control.locator("option").all():
-                    if (model_value and self._norm(option.inner_text()) == self._norm(model_value)
-                            and not option.evaluate("el => el.disabled")
-                            and str(option.evaluate("el => el.value") or "")):
-                        selected_model = self._choose_select_option(model_control, option.evaluate("el => el.value"))
-                        break
+                selected_model = choose_model(model_control, model_value)
             except Exception:
                 selected_model = False
             if not selected_model:
