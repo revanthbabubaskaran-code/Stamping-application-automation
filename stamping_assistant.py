@@ -26,6 +26,7 @@ from tkinter import filedialog, messagebox, ttk
 APP_NAME = "TN Stamping Assistant"
 PORTAL_URL = "https://labour.tn.gov.in/services/users/login?redirect=%2Fstamping-labours"
 STAMPING_URL = "https://labour.tn.gov.in/services/stamping-labours/stamping"
+CHROMIUM_CDP_ENDPOINT = "http://127.0.0.1:9229"
 APP_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "TNStampingAssistant"
 VAULT_FILE = APP_DIR / "profile.vault"
 FALLBACK_APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent) / ".TNStampingAssistant"
@@ -426,6 +427,9 @@ class PortalWorker(threading.Thread):
         self.messages = messages
         self.commands: queue.Queue = queue.Queue()
         self.page = None
+        self.context = None
+        self.browser = None
+        self.owns_browser = False
         self.ready = threading.Event()
         self.pending_application = None
         self.ready_for_submit = False
@@ -446,43 +450,47 @@ class PortalWorker(threading.Thread):
             return
         with sync_playwright() as pw:
             try:
-                # One-file Windows builds can need several seconds to extract
-                # the bundled browser on first launch. Keep startup generous;
-                # the UI queues its command while this worker initializes.
-                browser = pw.chromium.launch(
-                    headless=False,
-                    timeout=60000,
-                    args=["--start-maximized"],
-                )
+                browser, context, attached = self._connect_or_launch_chromium(pw)
+                self.browser = browser
+                self.context = context
+                self.owns_browser = not attached
+                self.page = self._find_active_portal_page(context)
+                if self.page is None:
+                    self.page = context.new_page()
+                self.page.set_default_timeout(9000)
+                self.page.set_default_navigation_timeout(20000)
             except Exception as e:
                 self.ready.set()
-                self.messages.put(("error", f"Could not start the app's Chromium browser. Rebuild the app with the bundled browser.\n{e}"))
+                self.messages.put(("error", f"Could not reuse or initialize the bundled Chromium session. The assistant will not open a duplicate browser.\n{e}"))
                 return
-            # Use Chromium's actual window dimensions as the page viewport.
-            # This makes the portal reflow when maximized or restored to a
-            # smaller window instead of keeping a fixed 1280x720 canvas.
-            context = browser.new_context(no_viewport=True)
-            self.page = context.new_page()
-            self.page.set_default_timeout(9000)
-            self.page.set_default_navigation_timeout(20000)
             self.ready.set()
             while True:
                 try:
                     cmd, payload = self.commands.get(timeout=0.5)
                 except queue.Empty:
                     if self.waiting_for_login:
-                        if self._logged_in():
+                        try:
+                            self._restore_active_portal_page()
+                            if self._logged_in():
+                                self.waiting_for_login = False
+                                self.login_attempt_at = 0.0
+                                self.messages.put(("login_ok", "Portal sign-in succeeded. Continue with Fill now / retry when the PDF draft is ready."))
+                            else:
+                                self._submit_login_after_captcha()
+                                self._report_login_failure_if_due()
+                        except Exception as exc:
                             self.waiting_for_login = False
-                            self.login_attempt_at = 0.0
-                            self.messages.put(("login_ok", "Portal sign-in succeeded. Continue with Fill now / retry when the PDF draft is ready."))
-                        else:
-                            self._submit_login_after_captcha()
-                            self._report_login_failure_if_due()
+                            self.messages.put(("error", f"The active Chromium session could not be checked. It was left open and no replacement browser was started. {exc}"))
                         continue
                     if self.pending_application is not None:
-                        if not self._logged_in():
-                            self._submit_login_after_captcha()
-                            self._report_login_failure_if_due()
+                        try:
+                            self._restore_active_portal_page()
+                            if not self._logged_in():
+                                self._submit_login_after_captcha()
+                                self._report_login_failure_if_due()
+                                continue
+                        except Exception as exc:
+                            self.messages.put(("error", f"The active Chromium session could not be checked. It was left open and no replacement browser was started. {exc}"))
                             continue
                         application = self.pending_application
                         self.pending_application = None
@@ -509,14 +517,28 @@ class PortalWorker(threading.Thread):
                 try:
                     if cmd == "open":
                         self.pending_application = payload.get("application")
-                        self.waiting_for_login = True
                         self.ready_for_submit = False
-                        self.workflow_step = 0
-                        self.final_edit_retry_used = False
-                        self._open_login_page()
-                        self._fill_login(payload["credentials"])
-                        self.messages.put(("opened", "Portal opened in bundled Chromium and saved sign-in filled. Enter the CAPTCHA there; the application will continue automatically if a PDF draft is ready."))
+                        self._restore_active_portal_page()
+                        if self._logged_in():
+                            self.waiting_for_login = False
+                            self.login_attempt_at = 0.0
+                            self.messages.put(("opened", "Reused the active signed-in Chromium page; it was not restarted or navigated away."))
+                        else:
+                            current_url = (self.page.url or "").strip().lower()
+                            if self._is_login_page():
+                                self.waiting_for_login = True
+                                self._fill_login(payload["credentials"])
+                                self.messages.put(("opened", "Reused the active Chromium login page and filled saved sign-in. Enter the CAPTCHA there; the application will continue automatically after login."))
+                            elif current_url in {"", "about:blank", "chrome://newtab/"}:
+                                self.waiting_for_login = True
+                                self._open_login_page()
+                                self._fill_login(payload["credentials"])
+                                self.messages.put(("opened", "Opened the portal in the existing Chromium window and filled saved sign-in. Enter the CAPTCHA there; the application will continue automatically after login."))
+                            else:
+                                self.waiting_for_login = False
+                                self.messages.put(("error", "The active Chromium page is not the portal login or stamping form. It was left unchanged; navigate to the portal in that window, then use Fill now / retry."))
                     elif cmd == "fill":
+                        self._restore_active_portal_page()
                         if not self._logged_in():
                             if self._is_login_page():
                                 self.pending_application = payload
@@ -549,10 +571,133 @@ class PortalWorker(threading.Thread):
                 except Exception as e:
                     self.messages.put(("error", f"Portal action stopped safely: {e}"))
             try:
-                context.close()
-                browser.close()
+                if self.context is not None and self.owns_browser:
+                    self.context.close()
+                if self.browser is not None:
+                    # For a CDP-attached browser this disconnects Playwright;
+                    # it must not close the user's already-running Chromium.
+                    self.browser.close()
             except Exception:
                 pass
+
+    @staticmethod
+    def _find_active_portal_page(context):
+        """Prefer the existing portal tab so retry never opens another window."""
+        try:
+            pages = [page for page in context.pages if not page.is_closed()]
+            portal_pages = [page for page in pages if "labour.tn.gov.in" in (page.url or "").lower()]
+            if portal_pages:
+                stamping = [page for page in portal_pages if "/stamping" in (page.url or "").lower()]
+                return stamping[-1] if stamping else portal_pages[-1]
+            return pages[-1] if pages else None
+        except Exception:
+            return None
+
+    def _restore_active_portal_page(self):
+        """Recover an open tab in the current Chromium context, never launch another."""
+        if self.context is None:
+            raise RuntimeError("The Chromium context is not available; reopen the assistant before starting another session.")
+        try:
+            if self.page is not None and not self.page.is_closed():
+                return
+        except Exception:
+            pass
+        page = self._find_active_portal_page(self.context)
+        if page is None:
+            page = self.context.new_page()
+        page.set_default_timeout(9000)
+        page.set_default_navigation_timeout(20000)
+        self.page = page
+
+    @staticmethod
+    def _bundled_chromium_is_running():
+        """Detect an old bundled browser process that cannot be safely reattached."""
+        browser_root = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")
+        if not browser_root or not Path(browser_root).is_dir():
+            return False
+        try:
+            candidates = [os.path.normcase(os.path.abspath(str(path))) for pattern in
+                          ("chromium-*/chrome-win/chrome.exe", "chromium-*/chrome-win64/chrome.exe")
+                          for path in Path(browser_root).glob(pattern)]
+            if not candidates:
+                return False
+            from ctypes import wintypes
+            TH32CS_SNAPPROCESS = 0x00000002
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+            class PROCESSENTRY32W(ctypes.Structure):
+                _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                            ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
+                            ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                            ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
+                            ("dwFlags", wintypes.DWORD), ("szExeFile", wintypes.WCHAR * 260)]
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+            kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+            kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+            kernel32.Process32FirstW.restype = wintypes.BOOL
+            kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+            kernel32.Process32NextW.restype = wintypes.BOOL
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+            kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+            if snapshot == wintypes.HANDLE(-1).value:
+                return False
+            try:
+                entry = PROCESSENTRY32W()
+                entry.dwSize = ctypes.sizeof(entry)
+                has_process = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+                while has_process:
+                    if entry.szExeFile.lower() == "chrome.exe":
+                        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, entry.th32ProcessID)
+                        if handle:
+                            try:
+                                buffer = ctypes.create_unicode_buffer(32768)
+                                size = wintypes.DWORD(len(buffer))
+                                if kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+                                    image = os.path.normcase(os.path.abspath(buffer.value))
+                                    is_playwright_chromium = (
+                                        image in candidates
+                                        or bool(re.search(r"[\\/]chromium-\d+[\\/]chrome-win(?:64)?[\\/]chrome\.exe$", image, re.I))
+                                    )
+                                    if is_playwright_chromium:
+                                        return True
+                            finally:
+                                kernel32.CloseHandle(handle)
+                    has_process = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+            finally:
+                kernel32.CloseHandle(snapshot)
+        except Exception:
+            # If process inspection is unavailable, the CDP port check still
+            # prevents duplicate launches for sessions started by this build.
+            return False
+        return False
+
+    @classmethod
+    def _connect_or_launch_chromium(cls, pw):
+        """Attach to this app's active Chromium first; launch only when none exists."""
+        try:
+            browser = pw.chromium.connect_over_cdp(CHROMIUM_CDP_ENDPOINT, timeout=2500)
+            contexts = browser.contexts
+            if contexts:
+                return browser, contexts[0], True
+            browser.close()
+        except Exception:
+            pass
+        if cls._bundled_chromium_is_running():
+            raise RuntimeError("A bundled Chromium process is already active but cannot be reattached. It was left untouched; close that browser window and retry to avoid opening a duplicate.")
+        browser = pw.chromium.launch(
+            headless=False,
+            timeout=60000,
+            args=["--start-maximized", "--remote-debugging-port=9229"],
+        )
+        context = browser.new_context(no_viewport=True)
+        return browser, context, False
 
     def _open_login_page(self):
         """Open the portal while tolerating its immediate login-to-service redirect."""
@@ -743,12 +888,17 @@ class PortalWorker(threading.Thread):
 
     def _logged_in(self) -> bool:
         page = self.page
+        if page is None or page.is_closed():
+            return False
         if page.locator('input[type="password"]:visible').count():
             return False
         for pattern in (r"log\s*out", r"dashboard", r"inbox"):
             if page.get_by_text(re.compile(pattern, re.I)).count():
                 return True
         if page.get_by_text(re.compile(r"THE LEGAL METROLOGY ACT", re.I)).count():
+            return True
+        current_url = (page.url or "").lower()
+        if "/services/stamping-labours/" in current_url and not re.search(r"/login(?:[/?#]|$)", current_url):
             return True
         return False
 
@@ -1035,14 +1185,14 @@ class PortalWorker(threading.Thread):
         else:
             raise RuntimeError("Could not identify the current portal step. Leave the page open and retry so the assistant can resume without navigating away.")
         self.ready_for_submit = False
-        if self.workflow_step <= 0:
+        if self.workflow_step <= 1:
             self.final_edit_retry_used = False
         report = {"filled": [], "skipped": [], "uploaded": [], "required_blank": [], "workflow_step": self.workflow_step}
         fields = payload["fields"]
         machines = payload.get("machine_rows") or [fields]
         groups = payload.get("item_groups") or self._group_items(machines)
 
-        if self.workflow_step <= 0:
+        if self.workflow_step <= 1:
             self._fill_establishment_page(fields, machines, payload, report)
             # The first-page controls must be completed in sequence before the
             # app touches Items or Previous Information lower on that page.
@@ -2623,15 +2773,38 @@ class PortalWorker(threading.Thread):
             controls = []
             for control in previous_scope.locator("select:visible").all():
                 try:
-                    options = [self._norm(option.inner_text()) for option in control.locator("option").all()]
-                    if any(label == "online" or "online other state" in label for label in options):
+                    if is_online_state_control(control):
                         controls.append(control)
                 except Exception:
                     continue
             return controls
 
+        def is_online_state_control(control):
+            """Identify the portal's Online/Other State select even if it was
+            briefly mistaken for a Model Name select while rows are rerendering."""
+            try:
+                labels = [self._norm(option.inner_text()) for option in control.locator("option").all()]
+                meaningful = [label for label in labels if label not in {"", "select", "please select"}]
+                return bool(meaningful) and all(
+                    label in {"online", "other state", "online/other state", "online other state"}
+                    or label.startswith("online/other state")
+                    for label in meaningful
+                )
+            except Exception:
+                return False
+
         def model_controls():
-            return self._controls_matching(previous_scope, model_pattern)
+            controls = []
+            for control in self._controls_matching(previous_scope, model_pattern):
+                # When the portal turns a selected Model Name row into an
+                # Online/Other State row, nearby/associated labels can briefly
+                # make that state select look like the former model control.
+                # Never send an instrument name to a select whose options are
+                # just the two state choices.
+                if is_online_state_control(control):
+                    continue
+                controls.append(control)
+            return controls
 
         def model_option_matches(option_label, item_label):
             """Allow portal dash/spacing variants while preserving item type/class."""
@@ -2654,24 +2827,42 @@ class PortalWorker(threading.Thread):
             overlap = len(item_tokens & option_tokens) / max(1, len(item_tokens))
             return overlap >= 0.72 or SequenceMatcher(None, item_norm, option_norm).ratio() >= 0.72
 
-        def choose_model(control, item_label):
-            choices = []
+        def model_option_values(control):
+            options = []
             try:
                 for option in control.locator("option").all():
-                    option_label = option.inner_text()
+                    label = re.sub(r"\s+", " ", option.inner_text()).strip()
                     value = str(option.evaluate("el => el.value") or "")
-                    if (value and not option.evaluate("el => el.disabled")
-                            and model_option_matches(option_label, item_label)):
+                    if (label and value and not option.evaluate("el => el.disabled")
+                            and self._norm(label) not in {"select", "please select"}):
+                        options.append((label, value))
+            except Exception:
+                pass
+            return options
+
+        def choose_model(control, item_label):
+            # The portal fills the model list asynchronously after Add. Keep
+            # checking for the requested item instead of failing on the first,
+            # often still-empty, snapshot of the options.
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                choices = []
+                for option_label, value in model_option_values(control):
+                    if model_option_matches(option_label, item_label):
                         score = SequenceMatcher(None, self._norm(option_label), self._norm(item_label)).ratio()
                         if self._norm(option_label) in self._norm(item_label) or self._norm(item_label) in self._norm(option_label):
                             score = 1.0
                         choices.append((score, value))
-            except Exception:
-                return False
-            if not choices:
-                return False
-            _score, value = max(choices, key=lambda item: item[0])
-            return self._choose_select_option(control, value)
+                if choices:
+                    _score, value = max(choices, key=lambda item: item[0])
+                    if self._choose_select_option(control, value):
+                        return True
+                page.wait_for_timeout(100)
+            return False
+
+        def model_options_summary(control):
+            labels = [label for label, _value in model_option_values(control)]
+            return ", ".join(labels[:12]) if labels else "none loaded"
 
         def previous_add_button():
             """Choose the Add beside Previous Information, not another repeater's Add."""
@@ -2794,10 +2985,9 @@ class PortalWorker(threading.Thread):
                 # Poll promptly but allow the portal's dependent-row request
                 # to finish. Some sessions take longer than one second even
                 # though the automation adds no intentional pause.
-                model_deadline = time.monotonic() + 5
                 model_control = None
                 row_ready = False
-                while time.monotonic() < model_deadline:
+                while True:
                     models = model_controls()
                     if len(models) > before_models:
                         model_control = models[-1]
@@ -2837,18 +3027,23 @@ class PortalWorker(threading.Thread):
                     model_control.click()
                     selected_model = choose_model(model_control, model_value)
                     if not selected_model:
-                        skipped.append(f"Previous Information Model for machine {current_rows + 1} (item option not available: {model_value})")
-                        return
-                    state_deadline = time.monotonic() + 5
-                    while time.monotonic() < state_deadline:
-                        if len(online_controls()) > before_states:
+                        # Some portal renders expose this row directly as an
+                        # Online/Other State select, despite the stale Model
+                        # Name label. Accept Online and continue to identifiers.
+                        if is_online_state_control(model_control) and select_online_when_ready(model_control):
+                            row_ready = True
+                        else:
+                            skipped.append(f"Previous Information Model for machine {current_rows + 1} (item option not available after waiting: {model_value}; available model options: {model_options_summary(model_control)})")
+                            return
+                    while True:
+                        if len(online_controls()) > before_states or (row_ready and model_control.is_visible()):
                             break
                         page.wait_for_timeout(25)
-                    else:
-                        skipped.append("Previous Information: model was selected, but its Online row did not load")
-                        return
                 current_rows += 1
-                filled.append(f"Previous Information Model {current_rows}")
+                if selected_model:
+                    filled.append(f"Previous Information Model {current_rows}")
+                else:
+                    filled.append(f"Previous Information Online {current_rows}")
             except Exception as exc:
                 skipped.append(f"Previous Information: could not create row {current_rows + 1}: {exc}")
                 return
@@ -2871,18 +3066,19 @@ class PortalWorker(threading.Thread):
             except Exception:
                 selected_model = False
             if not selected_model:
-                skipped.append(f"Previous Information Model for machine {row_index + 1} (item option not available: {model_value})")
+                if is_online_state_control(model_control) and select_online_when_ready(model_control):
+                    states = online_controls()
+                    models = model_controls()
+                    filled.append(f"Previous Information Online {row_index + 1}")
+                    continue
+                skipped.append(f"Previous Information Model for machine {row_index + 1} (item option not available after waiting: {model_value}; available model options: {model_options_summary(model_control)})")
                 return
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline:
+            while True:
                 states = online_controls()
                 models = model_controls()
                 if len(states) > row_index or not models:
                     break
                 page.wait_for_timeout(25)
-            if len(states) <= row_index:
-                skipped.append(f"Previous Information: model selection for machine {row_index + 1} did not create its Online row")
-                return
             filled.append(f"Previous Information Model {row_index + 1}")
         if len(online_controls()) < desired_rows:
             skipped.append(f"Previous Information: prepared {len(online_controls())} Online row(s), needs {desired_rows}; no identifiers were entered")
@@ -4427,3 +4623,4 @@ class App(tk.Tk):
 
 if __name__ == "__main__":
     App().mainloop()
+
