@@ -4,6 +4,7 @@ rem The app's Clear previous application action preserves the signed-in browser.
 rem It clears the selected CV, authorization/address files, and machine draft.
 rem With Use different address selected, the address PDF supplies the applicant name too.
 rem Machine data may come from a stamping transcription; portal upload can use another PDF.
+rem Confirm draft is ready snapshots the edited fields and machine CV references for filling.
 setlocal
 cd /d "%~dp0"
 if exist "%~dp0dist\TN_Stamping_Assistant_v69.exe" (
