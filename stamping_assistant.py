@@ -533,16 +533,28 @@ def extract_address_document(path: str) -> dict[str, str]:
     if not text.strip():
         raise RuntimeError("No selectable text was found in the address PDF. Use a text-searchable PDF.")
     fields = _extract_address_fields(text)
-    # When an alternate address PDF is selected, its M/S establishment line
-    # is the source of the applicant name as well as the address. Flatten line
-    # wraps so names split across PDF text lines remain intact.
+    # When an alternate address PDF is selected, its applicant/establishment
+    # name must override the name from the Previous CV. Prefer an explicit
+    # field label, then the standard M/S ... , Locality line. Flattening the
+    # latter handles PDF line wraps inside a business name.
     flat_text = re.sub(r"\s+", " ", text)
     applicant_name = first(
-        r"(?:belonging\s+to\s+)?M/S\.?\s+(.+?)(?=,\s*Locality\b)",
-        flat_text,
+        r"(?:Applicant\s*/\s*Establishment\s*Name|Name\s+of\s+(?:the\s+)?(?:Applicant|Establishment|User|Owner)|Establishment\s+Name|Applicant\s+Name)\s*[:\-]\s*(.+?)(?=,\s*(?:Locality|Address|Door\s*(?:No|Number)|Street)\b|\r?$)",
+        text,
+        re.I | re.M,
     )
-    if applicant_name:
-        fields["Applicant / establishment name"] = applicant_name
+    if not applicant_name:
+        applicant_name = first(
+            r"(?:belonging\s+to\s+)?M/S\.?\s+(.+?)(?=,\s*(?:Locality|Address|Door\s*(?:No|Number)|Street)\b)",
+            flat_text,
+        )
+    if not applicant_name:
+        raise RuntimeError(
+            "Could not identify the applicant/establishment name in the selected address PDF. "
+            "Include an Applicant/Establishment Name field or an M/S name before the address. "
+            "The Previous CV name will not be substituted."
+        )
+    fields["Applicant / establishment name"] = applicant_name
     if not any(fields.get(key) for key in ("Business address", "District", "Taluk", "Town / Village", "Pincode")):
         raise RuntimeError("No recognizable address was found. Use a PDF containing an address or locality with its PIN code.")
     return fields
@@ -4823,8 +4835,8 @@ class App(tk.Tk):
             if address_path:
                 page_count, meaningful_page_count, values, machines = parsed
                 address_fields = extract_address_document(address_path)
-                # Address source PDFs control address values only. Keep the
-                # main Previous CV as the source for every machine and CV field.
+                # The selected address PDF also controls the applicant name.
+                # Keep the main Previous CV as the source for machine and CV data.
                 values.update(address_fields)
                 parsed = page_count, meaningful_page_count, values, machines
             self.pdf_msgq.put(("parsed", (generation, path, address_path, parsed)))
