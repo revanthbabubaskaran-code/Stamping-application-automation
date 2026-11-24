@@ -1,4 +1,5 @@
 @echo off
+rem Keep this launcher alongside each source and executable update.
 setlocal
 cd /d "%~dp0"
 if exist "%~dp0dist\TN_Stamping_Assistant_v69.exe" (
@@ -13,3 +14,4 @@ echo The stamping executable was not found.
 echo Run build.ps1 first, or place this launcher beside TN_Stamping_Assistant_v69.exe.
 pause
 exit /b 1
+
