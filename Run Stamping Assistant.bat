@@ -1,5 +1,7 @@
 @echo off
 rem Keep this launcher alongside each source and executable update.
+rem The app's Clear previous application action preserves the signed-in browser.
+rem It clears the selected CV, authorization/address files, and machine draft.
 setlocal
 cd /d "%~dp0"
 if exist "%~dp0dist\TN_Stamping_Assistant_v69.exe" (
