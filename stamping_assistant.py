@@ -4675,7 +4675,7 @@ class App(tk.Tk):
         }
         self.machine_display_keys = machine_keys
         self.machine_display_headers = machine_headers
-        records = machine_data if machine_data is not None else [{name: values.get(name, "") for name in machine_keys}]
+        records = machine_data or [{name: values.get(name, "") for name in machine_keys}]
         for machine_index, record in enumerate(records):
             row_vars = {}
             for name in machine_keys:
@@ -4705,8 +4705,8 @@ class App(tk.Tk):
     def clear_previous_application(self):
         if not messagebox.askyesno(
             "Clear previous application",
-            "Clear the selected application files, parsed address, and machine rows from this assistant?\n\n"
-            "Your saved account and signed-in Chromium session will be kept. An application already open in the portal will not be changed.",
+            "Clear the selected previous CV and the application draft read from it?\n\n"
+            "Your saved account and sign-in session will be kept. An application already open in the portal will not be changed.",
             parent=self,
         ):
             return
@@ -4714,29 +4714,22 @@ class App(tk.Tk):
         self._pdf_reading = False
         for key in ("certificate", "authorization", "address_source"):
             self.files[key] = ""
-            display = self.files.get(key + "_display")
-            if display is not None:
-                display.set("No file selected")
+            self.files[key + "_display"].set("No file selected")
         self.use_different_address_var.set(False)
-        address_button = self.file_buttons.get("address_source")
-        if address_button is not None:
-            address_button.configure(state="disabled")
+        self._on_address_source_changed()
         self.read_pdf_button.configure(state="normal")
-        self._set_fields({}, machine_data=[])
+        self._set_fields({})
         self.stamping_place_var.set("Select")
         self.site_status_var.set("Select")
         self._sync_site_choice()
-        self.repairer_establishment_var.set("")
         self.application_part_states = []
         self.active_application_part = 0
         self.application_part_var.set("Part 1 of 1")
         self.application_part_combo.configure(values=("Part 1 of 1",))
-        self.application_part_row.pack_forget()
-        self.start_all_parts_button.pack_forget()
         self.application_part_status.set("")
         self.previous_info_status.set("No Previous Information errors.")
         self.draft_confirmed.set(False)
-        self.draft_confirmation_status.set("Choose documents and read a PDF to prepare a new application.")
+        self.draft_confirmation_status.set("Previous application cleared. Read a new certificate to prepare another draft.")
         self.status.set("Previous application cleared. Your saved account and sign-in session remain available.")
 
     def _render_machine_fields(self):
