@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 import ctypes
 import json
+import math
 import os
 import queue
 import re
@@ -26,6 +27,7 @@ from tkinter import filedialog, messagebox, ttk
 APP_NAME = "TN Stamping Assistant"
 PORTAL_URL = "https://labour.tn.gov.in/services/users/login?redirect=%2Fstamping-labours"
 STAMPING_URL = "https://labour.tn.gov.in/services/stamping-labours/stamping"
+STAMPING_LIST_URL = "https://labour.tn.gov.in/services/stamping-labours"
 CHROMIUM_CDP_ENDPOINT = "http://127.0.0.1:9229"
 APP_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "TNStampingAssistant"
 VAULT_FILE = APP_DIR / "profile.vault"
@@ -215,7 +217,7 @@ def normalize_text(value: str) -> str:
 
 
 def read_certificate_pages(path: str) -> tuple[int, list[dict]]:
-    """Read page text and table cells, omitting pages with only the TCPDF footer."""
+    """Read certificate text and only extract tables from plausible machine pages."""
     try:
         import pdfplumber
     except ImportError as exc:
@@ -225,10 +227,20 @@ def read_certificate_pages(path: str) -> tuple[int, list[dict]]:
         page_count = len(pdf.pages)
         for page_number, page in enumerate(pdf.pages, 1):
             text = page.extract_text() or ""
-            tables = page.extract_tables() or []
             meaningful = re.sub(r"(?im)^\s*powered\s+by\s+tcpdf.*$", "", text).strip()
             meaningful = re.sub(r"(?m)^\s*\d+\s*/\s*\d+\s*$", "", meaningful).strip()
-            if meaningful or any(str(cell or "").strip() for table in tables for row in table for cell in row):
+            if not meaningful:
+                continue
+            # Table extraction is the expensive part for long certificates.
+            # Skip it on pages that cannot contain an instrument record while
+            # retaining text extraction for page numbering and header fields.
+            machine_page = bool(re.search(
+                r"machine\s*(?:no\.?|number)|make\s*:|max\s*:|min\s*:|\be\s*/\s*d\s*:|"
+                r"denomination|verification\s+fee|iron\s+hexagonal|weights\s+and\s+parallelepiped",
+                text, re.I,
+            ))
+            tables = page.extract_tables() or [] if machine_page else []
+            if meaningful:
                 result.append({"page_number": page_number, "text": text, "tables": tables})
     return page_count, result
 
@@ -256,7 +268,7 @@ def _extract_machine_record(text: str, tables=None) -> dict[str, str]:
                 "Maximum capacity": first(r"Max\s*:\s*(.+?)(?=\s+Min\s*:|\s+e/d\s*:|$)", manufacturer),
                 "Minimum capacity": first(r"Min\s*:\s*(.+?)(?=\s+e/d\s*:|$)", manufacturer),
                 "Verification interval (e/d)": first(r"e/d\s*:\s*(.+?)\s*$", manufacturer),
-                "Instrument model": _clean_cell(first(r"Model\s*:\s*(.+)$", model_cell)),
+                "Instrument model": _extract_model_value(model_cell),
                 "Machine number": first(r"Machine\s*(?:No\.?|Number)\s*:\s*(.+)$", number_cell),
                 "Class": _clean_cell(cells[5]),
                 "Additional fee": first(r"50%\s+Additional\s+Fee\s*:\s*([\d,.]+)", cells[9]) if len(cells) > 9 else "",
@@ -273,7 +285,7 @@ def _extract_machine_record(text: str, tables=None) -> dict[str, str]:
     record.update({
         "Instrument description": first(r"((?:Non-)?Automatic\s+.+?Class\s+(?:III|IIII|II|IV))\s*(?:\(|\n)", text),
         "Instrument make": first(r"Make\s*:\s*([^\n]+?)(?=\s+Max\s*:|\s+Min\s*:|\s+e/d\s*:|\s+Model\b|\s+Machine\s+No|$)", text),
-        "Instrument model": first(r"Model\s*:\s*([^\n]+)", text),
+        "Instrument model": _extract_model_value(text),
         "Machine number": first(r"Machine\s+No\.?\s*:\s*([^\n]+)", text),
         "Maximum capacity": first(r"Max\s*:\s*([^\n]+?)(?=\s+Min\s*:|\s+e/d\s*:|$)", text),
         "Minimum capacity": first(r"Min\s*:\s*([^\n]+?)(?=\s+e/d\s*:|$)", text),
@@ -297,12 +309,83 @@ def _item_count(value: str) -> int:
     return int(match.group(0)) if match else 1
 
 
+def plan_machine_parts(machine_count: int, max_per_part: int = 35,
+                       split_threshold: int = 40, min_tail: int = 10) -> list[int]:
+    """Plan separate applications for large certificates.
+
+    Up to 40 machines stay together. Larger files are balanced into batches
+    of at most 35 where possible. A final remainder below 10 reduces the
+    number of parts by one, then redistributes machines evenly (73 -> 37 +
+    36). With two batches, rebalance them so neither creates a tiny part
+    (for example 41 -> 21 + 20).
+    """
+    try:
+        total = max(0, int(machine_count))
+    except (TypeError, ValueError):
+        return []
+    if total == 0:
+        return []
+    if total <= split_threshold:
+        return [total]
+
+    part_count = math.ceil(total / max_per_part)
+    # A tail below ten should not become its own application. Reduce the
+    # number of parts and rebalance the records over the remaining parts.
+    greedy_tail = total - max_per_part * (part_count - 1)
+    if part_count >= 3 and 0 < greedy_tail < min_tail:
+        part_count -= 1
+
+    quotient, remainder = divmod(total, part_count)
+
+    if part_count == 2:
+        return [quotient + remainder, quotient]
+    # Put any balancing extras at the end for predictable, near-even parts.
+    return [quotient] * (part_count - remainder) + [quotient + 1] * remainder
+
+
 def _clean_cell(value: str) -> str:
     value = (value or "").replace("–", "-").replace("—", "-").replace("−", "-").replace("�", " ")
     cleaned = re.sub(r"\s+", " ", value).strip(" .,:;\n")
     cleaned = re.sub(r"(?i)\bnon-\s+automatic\b", "Non-Automatic", cleaned)
     cleaned = re.sub(r"\(\s+", "(", cleaned)
     return re.sub(r"\bweigh\s+t\b", "weight", cleaned, flags=re.I)
+
+
+def _clean_model(value: str) -> str:
+    """Join fragments split by PDF line wrapping without joining whole words."""
+    lines = [re.sub(r"\s+", " ", line).strip() for line in str(value or "").splitlines()]
+    result = ""
+    for line in (line for line in lines if line):
+        if not result:
+            result = line
+            continue
+        left = re.search(r"([A-Za-z0-9]+)$", result)
+        right = re.match(r"([A-Za-z0-9]+)(.*)$", line)
+        join_fragment = False
+        if left and right:
+            previous_fragment = left.group(1)
+            next_fragment = right.group(1)
+            # Numeric/code suffixes such as ELT3 + 0, plus short final
+            # fragments such as weigh + t, are common in wrapped model cells.
+            join_fragment = (
+                len(next_fragment) <= 1
+                or (previous_fragment[-1].isdigit() and next_fragment[0].isdigit())
+            )
+        if join_fragment:
+            result += right.group(1) + right.group(2)
+        else:
+            result += " " + line
+    return _clean_cell(result)
+
+
+def _extract_model_value(text: str) -> str:
+    """Extract a wrapped Model cell up to the next known certificate field."""
+    match = re.search(
+        r"\bModel\s*:\s*(.*?)(?=\bMachine\s*(?:No\.?|Number)\s*:|"
+        r"\b(?:Stamping|Verification)\s+Fee\s*:|\b50%\s+Additional\s+Fee\s*:|$)",
+        str(text or ""), re.I | re.S,
+    )
+    return _clean_model(match.group(1)) if match else ""
 
 
 def extract_certificate_document(path: str) -> tuple[int, int, dict[str, str], list[dict[str, str]]]:
@@ -313,6 +396,7 @@ def extract_certificate_document(path: str) -> tuple[int, int, dict[str, str], l
         machine = _extract_machine_record(page["text"], page["tables"])
         if machine.get("Machine number") or machine.get("Instrument make") or _is_weights_item(machine.get("Instrument description", "")):
             machine["Previous CV number"] = first(r"CV\s*No\.?\s*:\s*([^\n]+)", page["text"])
+            machine["Previous CV date"] = extract_certificate(page["text"], page["tables"]).get("Previous CV date", "")
             machine["Source PDF page"] = page["page_number"]
             machine["Application number"] = first(r"Application\s+Number\s*:\s*([^\n]+)", page["text"])
             machine["Additional fee"] = first(r"50%\s+Additional\s+Fee\s*:\s*([\d,.]+)", page["text"]) or machine.get("Additional fee", "")
@@ -390,7 +474,7 @@ def extract_certificate(text: str, tables=None) -> dict[str, str]:
         "Applicant / establishment name": first(r"belonging to\s+M/S\s+(.+?)(?:,\s*Locality|\n)", text),
         "Instrument description": first(r"((?:Non-)?Automatic\s+.+?Class\s+(?:III|II|IV))\s*(?:\(|\n)", text),
         "Instrument make": first(r"Make\s*:\s*([^\n]+?)(?:\s+Max\s*:|\s+Model\s*:|\s+Machine\s+No\.?\s*:|\n)", text),
-        "Instrument model": first(r"Model\s*:\s*([^\n]+?)(?:\s+Machine\s+No\.?\s*:|\s+Stamping Fee|\n)", text),
+        "Instrument model": _extract_model_value(text),
         "Machine number": first(r"Machine\s+No\.?\s*:\s*([^\n]+)", text),
         "Maximum capacity": first(r"Max\s*:\s*([^\n]+?)(?:\s+Min\s*:|\s+e/d\s*:|\n)", text),
         "Minimum capacity": first(r"Min\s*:\s*([^\n]+?)(?:\s+e/d\s*:|\n)", text),
@@ -402,22 +486,56 @@ def extract_certificate(text: str, tables=None) -> dict[str, str]:
         "Repairer licence number": first(r"Licence Number\s*:\s*([^\n.]+)", text),
         "Stamping office/site": first(r"Stamping\s+at\s+(Office|Site)", text),
     }
-    # Source certificate includes owner locality; preserve locality as its address draft.
-    raw_address = first(r"Locality\s+(.+?)(?=\s+Items\s+Quant|$)", text)
-    values["Business address"] = raw_address
-    values["State"] = "Tamil Nadu" if re.search(r"Tamil\s*Nadu", text, re.I) else ""
-    location = _locality_components(raw_address)
-    values["Taluk"] = location["taluk"]
-    values["District"] = location["district"]
-    values["Town / Village"] = location["town"]
-    values["Street"] = location["street"]
-    values["Door number"] = location["door_number"]
-    values["Pincode"] = first(r"\b(\d{6})\b", raw_address)
+    values.update(_extract_address_fields(text))
     values["Repairer licence date"] = first(r"Licence Number\s*:\s*[^\n]*?(\d{2}[-/]\d{2}[-/]\d{4})", text)
     values["Repairer business name"] = first(r"Repaired by\s+(.+?)(?:,\s*\d|\n)", text)
     values["Trader / establishment number"] = first(r"Trader\s+No\.?\s*:\s*\n\s*([^\n]+)", text)
     values.update(_extract_machine_record(text, tables))
     return values
+
+
+def _extract_address_fields(text: str) -> dict[str, str]:
+    """Extract address components without depending on a machine table."""
+    raw_address = first(
+        r"\bLocality\s+(.+?)(?=\s+Items\s+Quant(?:ity)?\b|\s+Verification\s+Fee\b|$)",
+        text,
+    )
+    if not raw_address:
+        raw_address = first(
+            r"\bAddress\s*[:\-]\s*(.+?)(?=\s+(?:Phone|Mobile|Cell|GSTIN?|PAN|Items\b|Invoice\s+No)\b|$)",
+            text,
+        )
+    if not raw_address:
+        # Many certificates print the address in a block ending with the PIN,
+        # without an explicit Address/Locality label. Keep only the lines
+        # surrounding the first PIN rather than absorbing the rest of a PDF.
+        lines = [re.sub(r"\s+", " ", line).strip() for line in (text or "").splitlines() if line.strip()]
+        pin_index = next((i for i, line in enumerate(lines) if re.search(r"\b\d{6}\b", line)), -1)
+        if pin_index >= 0:
+            start = max(0, pin_index - 4)
+            raw_address = ", ".join(lines[start:pin_index + 1])
+    location = _locality_components(raw_address)
+    return {
+        "Business address": raw_address,
+        "State": "Tamil Nadu" if re.search(r"Tamil\s*Nadu", raw_address or text, re.I) else "",
+        "District": location["district"],
+        "Taluk": location["taluk"],
+        "Town / Village": location["town"],
+        "Street": location["street"],
+        "Door number": location["door_number"],
+        "Pincode": first(r"\b(\d{6})\b", raw_address),
+    }
+
+
+def extract_address_document(path: str) -> dict[str, str]:
+    """Read address-only source PDFs; machine/CV data is intentionally ignored."""
+    text = pdf_text(path)
+    if not text.strip():
+        raise RuntimeError("No selectable text was found in the address PDF. Use a text-searchable PDF.")
+    fields = _extract_address_fields(text)
+    if not any(fields.get(key) for key in ("Business address", "District", "Taluk", "Town / Village", "Pincode")):
+        raise RuntimeError("No recognizable address was found. Use a PDF containing an address or locality with its PIN code.")
+    return fields
 
 
 class PortalWorker(threading.Thread):
@@ -440,6 +558,21 @@ class PortalWorker(threading.Thread):
         self.last_captcha_value = ""
         self.captcha_candidate_value = ""
         self.captcha_candidate_since = 0.0
+        self.application_queue: list[dict] = []
+        self.application_queue_index = -1
+
+    def _publish_fill_report(self, report):
+        self.messages.put(("details", report))
+        if report["required_blank"]:
+            missing = "; ".join(report["required_blank"][:16])
+            reasons = "; ".join(report.get("skipped", [])[:12])
+            detail = f" Automation details: {reasons}." if reasons else ""
+            self.messages.put(("error", f"The portal page is still incomplete. Missing or unconfirmed: {missing}.{detail} Complete those fields in the app browser; the application was not submitted."))
+        elif not report.get("final_submit_visible"):
+            self.messages.put(("error", "The portal did not reach a page with a visible Submit control. Review the fields reported as skipped, then use Fill now / retry; nothing was submitted."))
+        else:
+            self.ready_for_submit = True
+            self.messages.put(("ready_to_submit", "The form reached final review. Check it in Chromium, then choose Submit application in the assistant when ready."))
 
     def run(self):
         try:
@@ -496,19 +629,12 @@ class PortalWorker(threading.Thread):
                         self.pending_application = None
                         self.login_attempt_at = 0.0
                         try:
-                            report = self._fill_form(application)
-                            report["automatic"] = True
-                            self.messages.put(("details", report))
-                            if report["required_blank"]:
-                                missing = "; ".join(report["required_blank"][:16])
-                                reasons = "; ".join(report.get("skipped", [])[:12])
-                                detail = f" Automation details: {reasons}." if reasons else ""
-                                self.messages.put(("error", f"The portal page is still incomplete. Missing or unconfirmed: {missing}.{detail} Complete those fields in the app browser; the application was not submitted."))
-                            elif not report.get("final_submit_visible"):
-                                self.messages.put(("error", "The portal did not reach a page with a visible Submit control. Review the fields reported as skipped, then use Fill now / retry; nothing was submitted."))
+                            if self.application_queue:
+                                self._open_queued_application(0)
                             else:
-                                self.ready_for_submit = True
-                                self.messages.put(("ready_to_submit", "The form reached final review. Check it in Chromium, then choose Submit application in the assistant when ready."))
+                                report = self._fill_form(application)
+                                report["automatic"] = True
+                                self._publish_fill_report(report)
                         except Exception as e:
                             self.messages.put(("error", f"Login was detected, but the automatic form steps stopped safely: {e}"))
                     continue
@@ -539,6 +665,8 @@ class PortalWorker(threading.Thread):
                                 self.messages.put(("error", "The active Chromium page is not the portal login or stamping form. It was left unchanged; navigate to the portal in that window, then use Fill now / retry."))
                     elif cmd == "fill":
                         self._restore_active_portal_page()
+                        if self.application_queue and 0 <= self.application_queue_index < len(self.application_queue):
+                            payload = self.application_queue[self.application_queue_index]
                         if not self._logged_in():
                             if self._is_login_page():
                                 self.pending_application = payload
@@ -549,19 +677,54 @@ class PortalWorker(threading.Thread):
                                 self.messages.put(("error", "The current portal page could not be confirmed as signed in. It was left open; sign in manually if needed, then retry."))
                         else:
                             report = self._fill_form(payload)
-                            self.messages.put(("details", report))
-                            if report["required_blank"]:
-                                missing = "; ".join(report["required_blank"][:16])
-                                reasons = "; ".join(report.get("skipped", [])[:12])
-                                detail = f" Automation details: {reasons}." if reasons else ""
-                                self.messages.put(("error", f"The portal page is still incomplete. Missing or unconfirmed: {missing}.{detail} Complete those fields in the app browser; the application was not submitted."))
-                            elif not report.get("final_submit_visible"):
-                                self.messages.put(("error", "The portal did not reach a page with a visible Submit control. Review the fields reported as skipped, then use Fill now / retry; nothing was submitted."))
+                            self._publish_fill_report(report)
+                    elif cmd == "new_application":
+                        # The current browser context keeps the existing portal
+                        # cookies. Navigate this same tab back to the service
+                        # landing page, open New Stamping, and reset only the
+                        # workflow step for the new reviewed PDF.
+                        self._restore_active_portal_page()
+                        if not self._logged_in():
+                            raise RuntimeError("The existing portal session is no longer signed in. Sign in in the current Chromium window, then start the new application again.")
+                        self.ready_for_submit = False
+                        self.pending_application = None
+                        self.workflow_step = 0
+                        self.final_edit_retry_used = False
+                        self._navigate_to_stamping_form(force_new=True)
+                        report = self._fill_form(payload)
+                        self._publish_fill_report(report)
+                    elif cmd == "apply_all_parts":
+                        applications = payload.get("applications", [])
+                        if len(applications) < 2:
+                            raise RuntimeError("This PDF does not contain multiple application parts.")
+                        if self.application_queue:
+                            raise RuntimeError("A multi-part application is already in progress. Finish or correct its current part first.")
+                        self._restore_active_portal_page()
+                        self.application_queue = applications
+                        self.application_queue_index = 0
+                        self.ready_for_submit = False
+                        self.messages.put(("multi_part_started", len(applications)))
+                        if not self._logged_in():
+                            self.pending_application = applications[0]
+                            self.waiting_for_login = True
+                            current_url = (self.page.url or "").strip().lower()
+                            if self._is_login_page():
+                                self._fill_login(payload.get("credentials", {}))
+                                self.messages.put(("opened", "Sign in once and complete CAPTCHA. All remaining application parts will reuse this signed-in session."))
+                            elif current_url in {"", "about:blank", "chrome://newtab/"}:
+                                self._open_login_page()
+                                self._fill_login(payload.get("credentials", {}))
+                                self.messages.put(("opened", "Sign in once and complete CAPTCHA. All remaining application parts will reuse this signed-in session."))
                             else:
-                                self.ready_for_submit = True
-                                self.messages.put(("ready_to_submit", "The form reached final review. Check it in Chromium, then choose Submit application in the assistant when ready."))
+                                self._open_login_page()
+                                self._fill_login(payload.get("credentials", {}))
+                                self.messages.put(("opened", "Sign in once and complete CAPTCHA. All remaining application parts will reuse this signed-in session."))
+                        else:
+                            self._open_queued_application(0)
                     elif cmd == "submit":
-                        self._submit()
+                        submitted = self._submit()
+                        if submitted and self.application_queue:
+                            self._open_queued_application(self.application_queue_index + 1)
                     elif cmd == "credentials":
                         if not self._logged_in():
                             if self.pending_application is None:
@@ -920,11 +1083,20 @@ class PortalWorker(threading.Thread):
             pass
         return False
 
-    def _navigate_to_stamping_form(self):
+    def _navigate_to_stamping_form(self, force_new=False):
         page = self.page
-        if not self._logged_in():
+        if force_new:
+            # Keep the signed-in browser context and its cookies, but start a
+            # clean New Stamping form from the service landing page.
+            page.goto(STAMPING_LIST_URL, wait_until="commit", timeout=30000)
+            try:
+                page.get_by_text(re.compile(r"The Legal Metrology Act,\s*2009.*Verification and Stamping", re.I)).first.wait_for(state="visible", timeout=15000)
+            except Exception:
+                if not self._logged_in():
+                    raise RuntimeError("The portal session expired while opening the service page; sign in again in the current browser.")
+        elif not self._logged_in():
             raise RuntimeError("Login is not detected yet. Complete the CAPTCHA and click Login in the app browser.")
-        if page.locator("#Stamping").count() and page.locator("#Stamping").first.is_visible():
+        if not force_new and page.locator("#Stamping").count() and page.locator("#Stamping").first.is_visible():
             # The portal often renders its form shell before the fields become
             # available. Wait for the first actual control before building the
             # fill queue; otherwise every dependent field can be misreported as
@@ -948,6 +1120,28 @@ class PortalWorker(threading.Thread):
                 page.locator("#Stamping").wait_for(state="attached", timeout=10000)
             except Exception as exc:
                 raise RuntimeError(f"Could not reach the New Stamping form: {exc}") from exc
+
+    def _open_queued_application(self, index):
+        """Open one part in a fresh tab inside the already signed-in context."""
+        if index < 0 or index >= len(self.application_queue):
+            self.application_queue = []
+            self.application_queue_index = -1
+            self.messages.put(("multi_part_done", "All split application parts reached their individual final review/payment steps. Payment remains manual in each tab."))
+            return
+        if self.context is None:
+            raise RuntimeError("The signed-in Chromium context is no longer available; no replacement browser was started.")
+        self.application_queue_index = index
+        self.page = self.context.new_page()
+        self.page.set_default_timeout(9000)
+        self.page.set_default_navigation_timeout(20000)
+        payload = self.application_queue[index]
+        self._navigate_to_stamping_form(force_new=True)
+        self.messages.put(("progress", f"Filling application part {index + 1} of {len(self.application_queue)} in a new signed-in tab"))
+        report = self._fill_form(payload)
+        report["application_part"] = index + 1
+        report["application_part_count"] = len(self.application_queue)
+        self.messages.put(("multi_part_part", (index, len(self.application_queue))))
+        self._publish_fill_report(report)
 
     @staticmethod
     def _norm(s: str) -> str:
@@ -1193,6 +1387,7 @@ class PortalWorker(threading.Thread):
         groups = payload.get("item_groups") or self._group_items(machines)
 
         if self.workflow_step <= 1:
+            self.messages.put(("progress", "Filling first-page sections in order: top to bottom, left to right"))
             self._fill_establishment_page(fields, machines, payload, report)
             # The first-page controls must be completed in sequence before the
             # app touches Items or Previous Information lower on that page.
@@ -1201,6 +1396,7 @@ class PortalWorker(threading.Thread):
             if report["required_blank"]:
                 return report
         if self.workflow_step <= 1:
+            self.messages.put(("progress", "First-page address and license fields are complete; preparing item and certificate rows"))
             # Items and Previous Information are lower sections on this same
             # first portal page. Fill them before validating or clicking Next.
             self._fill_items_and_previous_information(
@@ -1239,6 +1435,7 @@ class PortalWorker(threading.Thread):
             self.workflow_step = 2
 
         if self.workflow_step <= 2:
+            self.messages.put(("progress", "Filling machine details on page 2"))
             self._fill_machine_detail_tables(groups, machines, report["skipped"], report["filled"])
             filled_machine_cvs = {
                 item for item in report["filled"]
@@ -1470,18 +1667,24 @@ class PortalWorker(threading.Thread):
 
     def _fill_establishment_page(self, fields, machines, payload, report):
         page = self.page
-        page_stamping_modes = {
-            normalize_text(row.get("Stamping office/site", ""))
-            for row in machines
-            if str(row.get("Stamping office/site", "")).strip()
-        }
-        if len(page_stamping_modes) == 1:
-            mode = next(iter(page_stamping_modes))
-            fields["Stamping office/site"] = "Site" if mode == "site" else "Office" if mode == "office" else fields.get("Stamping office/site", "")
-        elif len(page_stamping_modes) > 1:
-            labels = ", ".join(sorted(mode.title() for mode in page_stamping_modes))
-            fields["Stamping office/site"] = ""
-            report["skipped"].append(f"Stamping office/site (PDF pages have conflicting labels: {labels})")
+        # The choice made in the app is authoritative. Previous certificates
+        # can have been stamped at a different location from the new request;
+        # their page labels describe history, not the current application.
+        # Use the PDF label only as a fallback for callers that did not supply
+        # a valid Office/Site choice at all.
+        selected_place = str(fields.get("Stamping office/site", "")).strip()
+        if selected_place.casefold() not in {"office", "site"}:
+            page_stamping_modes = {
+                normalize_text(row.get("Stamping office/site", ""))
+                for row in machines
+                if str(row.get("Stamping office/site", "")).strip()
+            }
+            if len(page_stamping_modes) == 1:
+                mode = next(iter(page_stamping_modes))
+                fields["Stamping office/site"] = "Site" if mode == "site" else "Office" if mode == "office" else ""
+            elif len(page_stamping_modes) > 1:
+                labels = ", ".join(sorted(mode.title() for mode in page_stamping_modes))
+                report["skipped"].append(f"Stamping office/site (select Office or Site in the app; certificate pages conflict: {labels})")
 
         # Order first-page inputs, choices, and uploads by visible position.
         machine_descriptions = [str(row.get("Instrument description", "")).strip().lower() for row in machines]
@@ -1942,8 +2145,12 @@ class PortalWorker(threading.Thread):
             return True
 
         pending_actions = sorted(actions, key=action_order)
+        progress_index = 0
         while pending_actions:
             _top, field, locator, value, action_type = pending_actions.pop(0)
+            progress_index += 1
+            if progress_index == 1 or progress_index % 4 == 0:
+                self.messages.put(("progress", f"Filling first page, field {progress_index}: {field}"))
             if locator is None:
                 try:
                     if field == "Manufacturer / Trader establishment name":
@@ -2454,7 +2661,11 @@ class PortalWorker(threading.Thread):
             raise RuntimeError(f"Could not find the Next control for the {expected_page}. Review the current portal page.")
         previous_url = page.url
         previous_signature = self._visible_form_signature()
-        next_button.click(timeout=10000)
+        # The portal's Next handler can finish the click and start a slow
+        # navigation that exceeds Playwright's click navigation wait. Do not
+        # make the click itself wait for that navigation; the URL/form-step
+        # check below is the authoritative confirmation that the page moved.
+        next_button.click(timeout=10000, no_wait_after=True)
         try:
             page.wait_for_load_state("domcontentloaded", timeout=12000)
         except Exception:
@@ -2557,11 +2768,13 @@ class PortalWorker(threading.Thread):
             if add is None:
                 break
             try:
-                add.click()
-                deadline = time.monotonic() + 8
+                # Add is an AJAX repeater action. Do not let Playwright wait
+                # for a document navigation that the portal never performs.
+                add.click(no_wait_after=True)
+                deadline = time.monotonic() + 5
                 updated = current
                 while time.monotonic() < deadline and updated <= current:
-                    self.page.wait_for_timeout(200)
+                    self.page.wait_for_timeout(75)
                     updated = count_fn()
             except Exception:
                 break
@@ -2732,36 +2945,23 @@ class PortalWorker(threading.Thread):
             """Locate identifier inputs in this Online row, never in another row."""
             for depth in range(1, 10):
                 scope = state_control.locator("xpath=" + "/".join([".."] * depth))
-                states_in_scope = []
-                for select in scope.locator("select:visible").all():
-                    labels = [self._norm(option.inner_text()) for option in select.locator("option").all()]
-                    if "online" in labels:
-                        states_in_scope.append(select)
-                if len(states_in_scope) > 1:
-                    break
+                scoped_selects = scope.locator("select:visible").all()
+                if len(scoped_selects) != 1:
+                    if len(scoped_selects) > 1:
+                        break
+                    continue
                 inputs = scope.locator("input:visible:not([type='hidden']):not([type='button']):not([type='submit']):not([type='file']),textarea:visible").all()
                 if len(inputs) != 3:
                     continue
-                # The portal's Online row has Date, Application Number, then
-                # Certificate Number in DOM order. Use semantic labels first;
-                # the three-input layout covers unassociated/duplicate labels.
-                result = []
-                for pattern, fallback in ((app_pattern, 1), (cv_pattern, 2), (r"certificate\s*date|previous\s*cv\s*date", 0)):
-                    candidates = self._controls_matching(scope, pattern)
-                    unique = []
-                    for candidate in candidates:
-                        handle = candidate.element_handle()
-                        if not any(existing.evaluate("(el, other) => el === other", handle) for existing in unique):
-                            unique.append(candidate)
-                    result.append(unique[0] if len(unique) == 1 else inputs[fallback])
-                # Ambiguous semantic labels must not assign one input twice.
-                if any(result[i].evaluate("(el, other) => el === other", result[j].element_handle()) for i in range(3) for j in range(i)):
-                    return inputs[1], inputs[2], inputs[0]
-                return tuple(result)
+                # In the portal's Previous Information row DOM order is Date,
+                # Application Number, Certificate Number. The row-local
+                # structure is stable; avoid a document-wide accessible-label
+                # scan for every machine (quadratic on long certificates).
+                return inputs[1], inputs[2], inputs[0]
             return None
 
         def wait_for_row_inputs(state_control):
-            deadline = time.monotonic() + 12
+            deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
                 result = row_inputs(state_control)
                 if result is not None:
@@ -2769,21 +2969,54 @@ class PortalWorker(threading.Thread):
                 page.wait_for_timeout(50)
             return None
 
+        select_snapshot_cache = {"at": 0.0, "rows": []}
+
+        def select_snapshot():
+            now = time.monotonic()
+            if now - select_snapshot_cache["at"] < 0.2:
+                return select_snapshot_cache["rows"]
+            locator = previous_scope.locator("select:visible")
+            try:
+                rows = locator.evaluate_all(r"""selects => {
+                    const text = el => (el?.innerText || el?.textContent || '').replace(/\s+/g,' ').trim();
+                    return selects.map((select, index) => {
+                      let labelText = [...(select.labels || [])].map(text).filter(Boolean).join(' ');
+                      if (!labelText) labelText = text(select.closest('label'));
+                      if (!labelText) {
+                        const host = select.closest('.form-group,.form-row,.field,.col,.row') || select.parentElement;
+                        const label = host?.querySelector('label,.control-label,[class*=label]');
+                        labelText = text(label);
+                      }
+                      const options = [...select.options].map(option => ({
+                        label: text(option), value: option.value, disabled: option.disabled
+                      }));
+                      return { index, label: labelText, options };
+                    });
+                }""")
+                select_snapshot_cache["rows"] = [(locator.nth(row["index"]), row) for row in rows]
+                select_snapshot_cache["at"] = now
+            except Exception:
+                select_snapshot_cache["rows"] = []
+                select_snapshot_cache["at"] = now
+            return select_snapshot_cache["rows"]
+
+        def online_info(row):
+            meaningful = [self._norm(option["label"]) for option in row["options"]
+                          if self._norm(option["label"]) not in {"", "select", "please select"}]
+            return bool(meaningful) and all(
+                label in {"online", "other state", "online/other state", "online other state"}
+                or label.startswith("online/other state") for label in meaningful
+            )
+
         def online_controls():
-            controls = []
-            for control in previous_scope.locator("select:visible").all():
-                try:
-                    if is_online_state_control(control):
-                        controls.append(control)
-                except Exception:
-                    continue
-            return controls
+            return [control for control, row in select_snapshot() if online_info(row)]
 
         def is_online_state_control(control):
             """Identify the portal's Online/Other State select even if it was
             briefly mistaken for a Model Name select while rows are rerendering."""
             try:
-                labels = [self._norm(option.inner_text()) for option in control.locator("option").all()]
+                labels = control.locator("option").evaluate_all("options => options.map(option => (option.innerText || option.textContent || '').replace(/\\s+/g,' ').trim())")
+                labels = [self._norm(label) for label in labels]
                 meaningful = [label for label in labels if label not in {"", "select", "please select"}]
                 return bool(meaningful) and all(
                     label in {"online", "other state", "online/other state", "online other state"}
@@ -2794,17 +3027,10 @@ class PortalWorker(threading.Thread):
                 return False
 
         def model_controls():
-            controls = []
-            for control in self._controls_matching(previous_scope, model_pattern):
-                # When the portal turns a selected Model Name row into an
-                # Online/Other State row, nearby/associated labels can briefly
-                # make that state select look like the former model control.
-                # Never send an instrument name to a select whose options are
-                # just the two state choices.
-                if is_online_state_control(control):
-                    continue
-                controls.append(control)
-            return controls
+            # Previous Information contains one select per row. Any select
+            # whose options are not the Online/Other State choices is still a
+            # Model Name row, even while the portal is loading its options.
+            return [control for control, row in select_snapshot() if not online_info(row)]
 
         def model_option_matches(option_label, item_label):
             """Allow portal dash/spacing variants while preserving item type/class."""
@@ -2828,23 +3054,33 @@ class PortalWorker(threading.Thread):
             return overlap >= 0.72 or SequenceMatcher(None, item_norm, option_norm).ratio() >= 0.72
 
         def model_option_values(control):
-            options = []
             try:
-                for option in control.locator("option").all():
-                    label = re.sub(r"\s+", " ", option.inner_text()).strip()
-                    value = str(option.evaluate("el => el.value") or "")
-                    if (label and value and not option.evaluate("el => el.disabled")
-                            and self._norm(label) not in {"select", "please select"}):
-                        options.append((label, value))
+                return control.locator("option").evaluate_all(r"""options => options.map(option => ({
+                    label: (option.innerText || option.textContent || '').replace(/\s+/g,' ').trim(),
+                    value: option.value || '', disabled: !!option.disabled
+                })).filter(option => option.label && option.value && !option.disabled &&
+                    !/^(select|please select)$/i.test(option.label))
+                  .map(option => [option.label, option.value])""")
             except Exception:
-                pass
-            return options
+                return []
+
+        model_choice_cache = {}
 
         def choose_model(control, item_label):
             # The portal fills the model list asynchronously after Add. Keep
             # checking for the requested item instead of failing on the first,
             # often still-empty, snapshot of the options.
-            deadline = time.monotonic() + 15
+            cache_key = self._norm(item_label)
+            cached_value = model_choice_cache.get(cache_key)
+            if cached_value:
+                try:
+                    if self._choose_select_option(control, cached_value):
+                        selected_label = re.sub(r"\s+", " ", control.locator("option:checked").first.inner_text()).strip()
+                        if model_option_matches(selected_label, item_label):
+                            return True
+                except Exception:
+                    pass
+            deadline = time.monotonic() + 7
             while time.monotonic() < deadline:
                 choices = []
                 for option_label, value in model_option_values(control):
@@ -2856,6 +3092,7 @@ class PortalWorker(threading.Thread):
                 if choices:
                     _score, value = max(choices, key=lambda item: item[0])
                     if self._choose_select_option(control, value):
+                        model_choice_cache[cache_key] = value
                         return True
                 page.wait_for_timeout(100)
             return False
@@ -2867,27 +3104,33 @@ class PortalWorker(threading.Thread):
         def previous_add_button():
             """Choose the Add beside Previous Information, not another repeater's Add."""
             candidates = []
-            for control in previous_scope.locator("button,a,[role='button'],input[type='button']").all():
-                try:
-                    if not control.is_visible():
-                        continue
-                    label = " ".join(filter(None, [control.inner_text(timeout=500), control.get_attribute("value"), control.get_attribute("aria-label"), control.get_attribute("title")]))
-                    if not re.fullmatch(r"\s*(?:\+\s*)?(?:add|add more|add another|add new|add row)\s*", label, re.I):
-                        continue
-                    top = float(control.evaluate("el => el.getBoundingClientRect().top"))
-                    states_now = online_controls()
-                    anchor = float(states_now[-1].evaluate("el => el.getBoundingClientRect().top")) if states_now else top
-                    candidates.append((abs(top - anchor), control))
-                except Exception:
-                    continue
-            return min(candidates, key=lambda item: item[0])[1] if candidates else None
+            states_now = online_controls()
+            anchor = float(states_now[-1].evaluate("el => el.getBoundingClientRect().top")) if states_now else None
+            locator = previous_scope.locator("button:visible,a:visible,[role='button']:visible,input[type='button']:visible")
+            try:
+                descriptions = locator.evaluate_all(r"""els => els.map(el => ({
+                    label: (el.innerText || el.value || el.getAttribute('aria-label') || el.title || '').replace(/\s+/g,' ').trim(),
+                    top: el.getBoundingClientRect().top
+                }))""")
+            except Exception:
+                descriptions = []
+            for index, item in enumerate(descriptions):
+                if re.fullmatch(r"\s*(?:\+\s*)?(?:add|add more|add another|add new|add row)\s*", item.get("label", ""), re.I):
+                    top = float(item.get("top", 0))
+                    candidates.append((abs(top - anchor) if anchor is not None else 0, index))
+            return locator.nth(min(candidates, key=lambda item: item[0])[1]) if candidates else None
 
         def previous_row_count():
-            # A new row may appear first as Model Name or directly as Online.
-            # Count its current state once; use Delete buttons as a secondary
-            # signal where the portal has already created them.
-            visible_rows = len(online_controls()) + len(model_controls())
-            return max(visible_rows, 1 + len(delete_buttons()))
+            # One select is rendered for each Previous Information row, even
+            # while its Model Name options are still loading. Counting all
+            # section selects avoids missing a slow-loading placeholder row.
+            try:
+                count = previous_scope.locator("select:visible").count()
+                if count:
+                    return count
+            except Exception:
+                pass
+            return max(1, 1 + len(delete_buttons()))
 
         def delete_buttons():
             buttons = []
@@ -2905,7 +3148,7 @@ class PortalWorker(threading.Thread):
                 pass
             return buttons
 
-        def select_online_when_ready(control, timeout=15):
+        def select_online_when_ready(control, timeout=4):
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
                 try:
@@ -2920,7 +3163,7 @@ class PortalWorker(threading.Thread):
                 page.wait_for_timeout(50)
             return False
 
-        def wait_for_count(getter, required, timeout=12):
+        def wait_for_count(getter, required, timeout=8):
             deadline = time.monotonic() + timeout
             current = getter()
             while len(current) < required and time.monotonic() < deadline:
@@ -2967,83 +3210,73 @@ class PortalWorker(threading.Thread):
             for row in machines if str(row.get("Application number", "")).strip()
         ), "") or str(fallback_application_number or "").strip()
 
-        # Create each needed row immediately after the preceding Add. Select
-        # its item/model at once so the portal can transform it to the next
-        # Online row while the remaining rows are being prepared. Identifier
-        # filling happens after all rows exist; certificate date lookups can
-        # then finish without delaying the next Add click.
+        # First create every Previous Information row. Only if the portal
+        # refuses another Add until a Model Name is selected, select one model
+        # to unlock the next Add and continue. This avoids interleaving input
+        # entry with slow row creation on large certificates.
         while current_rows < desired_rows:
             add = previous_add_button()
             if add is None:
                 skipped.append(f"Previous Information: Add control not found; portal has {current_rows} rows, needs {desired_rows}")
                 return
             try:
-                before_models = len(model_controls())
-                before_states = len(online_controls())
-                before_rows = current_rows
-                add.click()
-                # Poll promptly but allow the portal's dependent-row request
-                # to finish. Some sessions take longer than one second even
-                # though the automation adds no intentional pause.
-                model_control = None
-                row_ready = False
-                while True:
-                    models = model_controls()
-                    if len(models) > before_models:
-                        model_control = models[-1]
+                before_count = previous_row_count()
+                # The portal updates this repeater asynchronously in the same
+                # document; waiting for a navigation here needlessly stalls
+                # every row on large certificates.
+                add.click(no_wait_after=True)
+                select_snapshot_cache["at"] = 0
+                add_deadline = time.monotonic() + 5
+                updated_count = before_count
+                while time.monotonic() < add_deadline:
+                    updated_count = previous_row_count()
+                    if updated_count > before_count:
                         break
-                    if len(online_controls()) > before_states:
-                        row_ready = True
+                    page.wait_for_timeout(50)
+                if updated_count > before_count:
+                    current_rows = updated_count
+                    if current_rows == desired_rows or current_rows % 3 == 0:
+                        self.messages.put(("progress", f"Preparing Previous Information rows: {current_rows}/{desired_rows}"))
+                    continue
+
+                # Some portal versions add an empty repeater placeholder but
+                # enable the next Add only after the current model is chosen.
+                # Unlock that one row, then resume the add-only phase.
+                models = model_controls()
+                states_now = online_controls()
+                if models:
+                    row_index = len(states_now)
+                    if row_index >= desired_rows:
                         break
-                    if previous_row_count() > before_rows:
-                        # Some portal versions insert a Model Name control
-                        # whose label is not associated with the select.
-                        # Identify it by the exact requested model option.
-                        model_value = machines[current_rows].get("Instrument description", "")
-                        online_ids = {control.get_attribute("id") for control in online_controls()}
-                        for candidate in previous_scope.locator("select:visible").all():
-                            if candidate.get_attribute("id") in online_ids:
-                                continue
-                            try:
-                                if any(model_option_matches(option.inner_text(), model_value)
-                                       and option.get_attribute("value")
-                                       and not option.evaluate("el => el.disabled")
-                                       for option in candidate.locator("option").all()):
-                                    model_control = candidate
-                                    break
-                            except Exception:
-                                continue
-                        if model_control is not None:
+                    model_control = models[0]
+                    model_value = machines[row_index].get("Instrument description", "")
+                    try:
+                        model_control.click()
+                        selected = choose_model(model_control, model_value)
+                    except Exception:
+                        selected = False
+                    if not selected and is_online_state_control(model_control):
+                        selected = select_online_when_ready(model_control)
+                    if not selected:
+                        skipped.append(f"Previous Information Model for machine {row_index + 1} (item option not available: {model_value}; available model options: {model_options_summary(model_control)})")
+                        return
+                    select_snapshot_cache["at"] = 0
+                    transform_deadline = time.monotonic() + 5
+                    while time.monotonic() < transform_deadline:
+                        states_now = online_controls()
+                        if len(states_now) > row_index or is_online_state_control(model_control):
                             break
-                        if len(online_controls()) > before_states:
-                            row_ready = True
-                            break
-                    page.wait_for_timeout(25)
-                if model_control is None and not row_ready:
-                    skipped.append("Previous Information: Add was clicked, but the new row did not appear after waiting for the portal")
-                    return
-                if model_control is not None:
-                    model_value = machines[current_rows].get("Instrument description", "")
-                    model_control.click()
-                    selected_model = choose_model(model_control, model_value)
-                    if not selected_model:
-                        # Some portal renders expose this row directly as an
-                        # Online/Other State select, despite the stale Model
-                        # Name label. Accept Online and continue to identifiers.
-                        if is_online_state_control(model_control) and select_online_when_ready(model_control):
-                            row_ready = True
-                        else:
-                            skipped.append(f"Previous Information Model for machine {current_rows + 1} (item option not available after waiting: {model_value}; available model options: {model_options_summary(model_control)})")
-                            return
-                    while True:
-                        if len(online_controls()) > before_states or (row_ready and model_control.is_visible()):
-                            break
-                        page.wait_for_timeout(25)
-                current_rows += 1
-                if selected_model:
-                    filled.append(f"Previous Information Model {current_rows}")
+                        page.wait_for_timeout(50)
+                    current_rows = previous_row_count()
+                    filled.append(f"Previous Information Model {row_index + 1}")
+                    if current_rows == desired_rows:
+                        break
+                    continue
                 else:
-                    filled.append(f"Previous Information Online {current_rows}")
+                    skipped.append(f"Previous Information: Add did not create row {current_rows + 1} within 5 seconds; prepared {current_rows} of {desired_rows}")
+                    return
+                if current_rows == desired_rows or current_rows % 3 == 0:
+                    self.messages.put(("progress", f"Preparing Previous Information rows: {current_rows}/{desired_rows}"))
             except Exception as exc:
                 skipped.append(f"Previous Information: could not create row {current_rows + 1}: {exc}")
                 return
@@ -3073,24 +3306,29 @@ class PortalWorker(threading.Thread):
                     continue
                 skipped.append(f"Previous Information Model for machine {row_index + 1} (item option not available after waiting: {model_value}; available model options: {model_options_summary(model_control)})")
                 return
-            while True:
+            transform_deadline = time.monotonic() + 5
+            while time.monotonic() < transform_deadline:
+                select_snapshot_cache["at"] = 0
                 states = online_controls()
                 models = model_controls()
                 if len(states) > row_index or not models:
                     break
-                page.wait_for_timeout(25)
+                page.wait_for_timeout(40)
+            else:
+                skipped.append(f"Previous Information row {row_index + 1} did not finish loading after model selection")
+                return
             filled.append(f"Previous Information Model {row_index + 1}")
         if len(online_controls()) < desired_rows:
             skipped.append(f"Previous Information: prepared {len(online_controls())} Online row(s), needs {desired_rows}; no identifiers were entered")
             return
 
+        date_rows = []
+        states = online_controls()
         for index, machine in enumerate(machines):
-            current_rows = previous_row_count()
-            if current_rows < index + 1:
-                skipped.append(f"Previous Information: row setup stopped before machine {index + 1}; no identifiers were entered for remaining rows")
-                return
-            states = online_controls()
-            state_control = states[index] if len(states) > index else None
+            if index >= len(states):
+                skipped.append(f"Previous Information: row {index + 1} is missing; remaining available machine rows will still be filled")
+                continue
+            state_control = states[index]
 
             if state_control is None or not select_online_when_ready(state_control):
                 skipped.append(f"Previous Information Online option for machine {index + 1}")
@@ -3099,33 +3337,32 @@ class PortalWorker(threading.Thread):
             identifiers = wait_for_row_inputs(state_control)
             if identifiers is None:
                 skipped.append(f"Previous Information row {index + 1}: identifier inputs did not load in this row")
-                return
+                continue
             app_control, cv_control, date_control = identifiers
-            apps = [None] * index + [app_control]
-            cvs = [None] * index + [cv_control]
             app_no = machine.get("Application number", "") or shared_application_number
             cv_no = machine.get("Previous CV number", "")
             row_value_controls = []
-            for label, controls, value in (("Application number", apps, app_no), ("Certificate number", cvs, cv_no)):
-                if index >= len(controls) or not value:
+            identifier_ok = True
+            for label, control, value in (("Application number", app_control, app_no), ("Certificate number", cv_control, cv_no)):
+                if not value:
                     reason = "source PDF application number unavailable" if label == "Application number" and not value else "control not found or source value unavailable"
                     skipped.append(f"Previous Information {label} for machine {index + 1} ({reason})")
+                    identifier_ok = False
                     continue
                 try:
-                    control = controls[index]
                     row_value_controls.append(control)
                     persisted = self._field_value_matches(control, value)
                     if persisted:
                         filled.append(f"Previous Information {label} {index + 1}")
                         continue
-                    ready_deadline = time.monotonic() + 15
+                    ready_deadline = time.monotonic() + 2.5
                     while time.monotonic() < ready_deadline:
                         try:
                             if control.is_visible() and control.is_enabled() and control.is_editable():
                                 break
                         except Exception:
                             pass
-                        page.wait_for_timeout(100)
+                        page.wait_for_timeout(50)
                     try:
                         ready = control.is_visible() and control.is_enabled() and control.is_editable()
                     except Exception:
@@ -3134,22 +3371,23 @@ class PortalWorker(threading.Thread):
                         skipped.append(f"Previous Information {label} for machine {index + 1} (field remained disabled)")
                         continue
                     persisted = False
-                    for _attempt in range(3):
+                    for _attempt in range(2):
                         try:
                             if self._fill_control(control, value):
-                                deadline = time.monotonic() + 1.2
+                                deadline = time.monotonic() + 0.8
                                 while time.monotonic() < deadline:
                                     if self._field_value_matches(control, value):
                                         persisted = True
                                         break
-                                    page.wait_for_timeout(100)
+                                    page.wait_for_timeout(50)
                             if persisted:
                                 break
                         except Exception:
-                            page.wait_for_timeout(150)
+                            page.wait_for_timeout(75)
                     if persisted:
                         filled.append(f"Previous Information {label} {index + 1}")
                     else:
+                        identifier_ok = False
                         try:
                             actual = control.input_value().strip()
                         except Exception:
@@ -3157,40 +3395,66 @@ class PortalWorker(threading.Thread):
                         skipped.append(f"Previous Information {label} for machine {index + 1} (value did not persist; field shows: {actual or 'blank'})")
                 except Exception as exc:
                     skipped.append(f"Previous Information {label} for machine {index + 1}: {exc}")
+                    identifier_ok = False
+            if identifier_ok:
+                try:
+                    date_handle = date_control.element_handle()
+                except Exception:
+                    date_handle = None
+                date_rows.append((index, date_control, row_value_controls, False, date_handle))
+            if (index + 1) % 3 == 0 or index + 1 == len(machines):
+                self.messages.put(("progress", f"Filling Previous Information identifiers: {index + 1}/{len(machines)}"))
 
-            # Certificate date is computed by the portal after both identifiers.
-            dates = [None] * index + [date_control]
-            if index < len(dates):
-                deadline = time.monotonic() + 30
-                refreshed_identifiers = False
-                while time.monotonic() < deadline:
-                    try:
-                        certificate_date = dates[index].input_value().strip()
-                        if certificate_date:
-                            filled.append(f"Previous Information Certificate date {index + 1}")
-                            break
-                    except Exception:
-                        break
-                    if not refreshed_identifiers:
-                        # Some portal builds attach the date lookup to blur on
-                        # both identifiers. Re-fire those normal form events
-                        # once in case the initial asynchronous lookup was lost.
-                        for identifier in row_value_controls:
+        # The portal looks up Certificate Dates asynchronously. Do not wait up
+        # to 30 seconds after each machine: all identifier pairs are entered
+        # first, then all dates share one lookup window.
+        pending_dates = {index: (control, identifiers, refreshed, handle)
+                         for index, control, identifiers, refreshed, handle in date_rows}
+        # Large applications can trigger dozens of asynchronous certificate
+        # lookups at once. Give the portal a scaled batch window instead of
+        # declaring later rows blank after the same short deadline used for a
+        # small certificate.
+        date_wait_seconds = min(120, max(30, len(date_rows) * 2))
+        date_deadline = time.monotonic() + date_wait_seconds
+        next_date_progress = time.monotonic() + 5
+        while pending_dates and time.monotonic() < date_deadline:
+            pending_items = list(pending_dates.items())
+            handles = [item[1][3] for item in pending_items]
+            batch_values = None
+            if handles and all(handle is not None for handle in handles):
+                try:
+                    batch_values = page.evaluate("elements => elements.map(element => element?.value || '')", handles)
+                except Exception:
+                    batch_values = None
+            for offset, (index, (date_control, identifiers, refreshed, handle)) in enumerate(pending_items):
+                try:
+                    date_value = batch_values[offset].strip() if batch_values is not None else date_control.input_value().strip()
+                    if date_value:
+                        filled.append(f"Previous Information Certificate date {index + 1}")
+                        pending_dates.pop(index, None)
+                        continue
+                    if not refreshed:
+                        for identifier in identifiers:
                             try:
                                 identifier.dispatch_event("input")
                                 identifier.dispatch_event("change")
                                 identifier.evaluate("el => el.blur()")
                             except Exception:
                                 pass
-                        refreshed_identifiers = True
-                    page.wait_for_timeout(150)
-                else:
-                    skipped.append(f"Previous Information Certificate date for machine {index + 1} (portal did not populate it)")
-            else:
-                skipped.append(f"Previous Information Certificate date for machine {index + 1} (control not found)")
-            if any(f"Previous Information {name} {index + 1}" not in filled
-                   for name in ("Application number", "Certificate number", "Certificate date")):
-                return
+                        pending_dates[index] = (date_control, identifiers, True, handle)
+                except Exception:
+                    pending_dates.pop(index, None)
+                    skipped.append(f"Previous Information Certificate date for machine {index + 1} (control not found)")
+            if pending_dates:
+                if time.monotonic() >= next_date_progress:
+                    self.messages.put((
+                        "progress",
+                        f"Waiting for portal certificate dates: {len(pending_dates)} of {len(date_rows)} still loading",
+                    ))
+                    next_date_progress = time.monotonic() + 5
+                page.wait_for_timeout(200)
+        for index in pending_dates:
+            skipped.append(f"Previous Information Certificate date for machine {index + 1} (portal did not populate it within {date_wait_seconds} seconds)")
 
     def _select_first_available(self, control):
         try:
@@ -3259,13 +3523,24 @@ class PortalWorker(threading.Thread):
                     if add is None:
                         break
                     try:
-                        add.click(); page.wait_for_timeout(450)
+                        previous_count = len(current_rows)
+                        # New machine rows are inserted in place; don't wait
+                        # for a navigation after the Add click.
+                        add.click(no_wait_after=True)
                     except Exception:
                         break
-                    updated = data_rows_for(table)
-                    if len(updated) <= len(current_rows):
+                    row_deadline = time.monotonic() + 5
+                    updated = current_rows
+                    while time.monotonic() < row_deadline:
+                        updated = data_rows_for(table)
+                        if len(updated) > previous_count:
+                            break
+                        page.wait_for_timeout(75)
+                    if len(updated) <= previous_count:
                         break
                     current_rows = updated
+                    if len(current_rows) == expected or len(current_rows) % 3 == 0:
+                        self.messages.put(("progress", f"Preparing machine detail rows: {len(current_rows)}/{expected}"))
             else:
                 current_rows = data_rows_for(table)
             if len(current_rows) < expected:
@@ -3345,7 +3620,7 @@ class PortalWorker(threading.Thread):
                         skipped.append(f"Machine {global_index + 1} {key}")
             cursor += 1
 
-    def _select_previous_cv_option(self, control, certificate_number, timeout=12):
+    def _select_previous_cv_option(self, control, certificate_number, timeout=5):
         """Select and verify the exact certificate belonging to this machine row."""
         if control.evaluate("el => el.tagName.toLowerCase()") != "select":
             return False
@@ -3354,13 +3629,17 @@ class PortalWorker(threading.Thread):
             return False
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            try:
+                options = control.locator("option").evaluate_all(r"""options => options.map(option => ({
+                    label: (option.innerText || option.textContent || '').replace(/\s+/g,' ').trim(),
+                    value: option.value || '', disabled: !!option.disabled
+                }))""")
+            except Exception:
+                options = []
             choices = []
-            for option in control.locator("option").all():
-                label = re.sub(r"\s+", " ", option.inner_text()).strip()
-                value = option.get_attribute("value")
-                if not label or not value or label.lower() in {"select", "please select"}:
-                    continue
-                if option.get_attribute("disabled") is not None:
+            for option in options:
+                label, value = option["label"], option["value"]
+                if not label or not value or option["disabled"] or label.lower() in {"select", "please select"}:
                     continue
                 normalized_label = self._norm(label)
                 normalized_value = self._norm(value)
@@ -3385,7 +3664,7 @@ class PortalWorker(threading.Thread):
                         return True
                 except Exception:
                     pass
-            self.page.wait_for_timeout(250)
+            self.page.wait_for_timeout(100)
         return False
 
     def _fill_machine_rows(self, rows, skipped):
@@ -3715,7 +3994,7 @@ class PortalWorker(threading.Thread):
         payment_text = re.compile(r"make payment|proceed to payment|pay now|payment gateway|payment successful", re.I)
         if re.search(r"payment|receipt|checkout", page.url, re.I) or page.get_by_text(payment_text).count():
             self.messages.put(("payment", "The portal is already at a payment step. The assistant will not interact with payment."))
-            return
+            return False
         if not self.ready_for_submit:
             raise RuntimeError("The application has not reached a verified final review page. Use Fill now / retry to complete the visible page first.")
         submit = self._find_visible_submit()
@@ -3736,27 +4015,43 @@ class PortalWorker(threading.Thread):
         else:
             self.messages.put(("submitted", "The application was submitted. The portal did not clearly identify the next page as payment; review the app browser. No payment was made."))
         self.ready_for_submit = False
+        return True
 
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("1030x820")
-        self.minsize(900, 690)
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        minimum_width = min(760, screen_width)
+        minimum_height = min(600, screen_height)
+        initial_width = max(minimum_width, min(1120, screen_width - 80))
+        initial_height = max(minimum_height, min(850, screen_height - 100))
+        self.geometry(f"{initial_width}x{initial_height}")
+        self.minsize(minimum_width, minimum_height)
+        self._machine_layout_columns = None
+        self._root_resize_pending = False
         self.theme_is_dark = None
+        self.theme_mode = "Auto"
         self._theme_widgets_applied = False
         self.msgq: queue.Queue = queue.Queue()
+        self.pdf_msgq: queue.Queue = queue.Queue()
+        self._pdf_reading = False
+        self._pdf_read_generation = 0
         self.worker: PortalWorker | None = None
         self.profile = {}
         try:
             self.profile = load_vault()
         except Exception as e:
             self._show_copyable_error("Profile could not be opened", f"Encrypted profile could not be read. It may belong to another Windows user.\n\n{e}")
-        self.files = {"certificate": "", "authorization": ""}
+        self.files = {"certificate": "", "authorization": "", "address_source": ""}
+        self.file_buttons = {}
         self.vars = {}
         self.machine_rows = []
         self.machine_metadata = []
+        self.application_part_states = []
+        self.active_application_part = 0
         self._styles()
         self._build()
         self._theme_widgets_applied = False
@@ -3768,7 +4063,7 @@ class App(tk.Tk):
         style = ttk.Style(self)
         style.theme_use("clam")
         self._apply_theme(self._system_dark_mode())
-        style.configure("TButton", font=("Segoe UI Semibold", 10), padding=(12, 8))
+        style.configure("TButton", font=("Segoe UI Semibold", 12), padding=(14, 10))
 
     @staticmethod
     def _copy_text_to_clipboard(value, widget):
@@ -3870,7 +4165,7 @@ class App(tk.Tk):
         ttk.Label(body, text="Select the message or use Copy error to paste it into an update.", wraplength=680).pack(anchor="w", pady=(0, 8))
         text_frame = ttk.Frame(body)
         text_frame.pack(fill="both", expand=True)
-        text = tk.Text(text_frame, wrap="word", font=("Consolas", 10), bg=p["card"], fg=p["fg"], insertbackground=p["fg"], selectbackground=p["selection"], relief="solid", borderwidth=1, padx=8, pady=8)
+        text = tk.Text(text_frame, wrap="word", font=("Consolas", 12), bg=p["card"], fg=p["fg"], insertbackground=p["fg"], selectbackground=p["selection"], relief="solid", borderwidth=1, padx=10, pady=10)
         scrollbar = ttk.Scrollbar(text_frame, orient="vertical", command=text.yview)
         text.configure(yscrollcommand=scrollbar.set)
         text.pack(side="left", fill="both", expand=True)
@@ -3928,10 +4223,10 @@ class App(tk.Tk):
                 feedback.set(f"Saved error text to {path}")
             except OSError as exc:
                 feedback.set(f"Could not save error text: {exc}")
-        tk.Button(footer, text="Copy error", command=copy_error, bg=p.get("accent", "#1261a0"), fg="#ffffff", activebackground=p.get("accent_active", p.get("accent", "#1261a0")), activeforeground="#ffffff", font=("Segoe UI Semibold", 10), padx=14, pady=6, relief="flat", borderwidth=0, highlightthickness=0).pack(side="left")
-        tk.Button(footer, text="Select all", command=select_all, bg=p.get("card", "#ffffff"), fg=p.get("fg", "#243247"), activebackground=p.get("border", "#c5ccd6"), font=("Segoe UI Semibold", 10), padx=14, pady=6, relief="solid", borderwidth=1, highlightthickness=0).pack(side="left", padx=(8, 0))
-        tk.Button(footer, text="Save error…", command=save_error, bg=p.get("card", "#ffffff"), fg=p.get("fg", "#243247"), activebackground=p.get("border", "#c5ccd6"), font=("Segoe UI Semibold", 10), padx=14, pady=6, relief="solid", borderwidth=1, highlightthickness=0).pack(side="left", padx=(8, 0))
-        tk.Button(footer, text="Close", command=dialog.destroy, bg=p.get("card", "#ffffff"), fg=p.get("fg", "#243247"), activebackground=p.get("border", "#c5ccd6"), font=("Segoe UI Semibold", 10), padx=14, pady=6, relief="solid", borderwidth=1, highlightthickness=0).pack(side="right")
+        tk.Button(footer, text="Copy error", command=copy_error, bg=p.get("accent", "#1261a0"), fg="#ffffff", activebackground=p.get("accent_active", p.get("accent", "#1261a0")), activeforeground="#ffffff", font=("Segoe UI Semibold", 12), padx=16, pady=9, relief="flat", borderwidth=0, highlightthickness=0).pack(side="left")
+        tk.Button(footer, text="Select all", command=select_all, bg=p.get("card", "#ffffff"), fg=p.get("fg", "#243247"), activebackground=p.get("border", "#c5ccd6"), font=("Segoe UI Semibold", 12), padx=16, pady=9, relief="solid", borderwidth=1, highlightthickness=0).pack(side="left", padx=(8, 0))
+        tk.Button(footer, text="Save error…", command=save_error, bg=p.get("card", "#ffffff"), fg=p.get("fg", "#243247"), activebackground=p.get("border", "#c5ccd6"), font=("Segoe UI Semibold", 12), padx=16, pady=9, relief="solid", borderwidth=1, highlightthickness=0).pack(side="left", padx=(8, 0))
+        tk.Button(footer, text="Close", command=dialog.destroy, bg=p.get("card", "#ffffff"), fg=p.get("fg", "#243247"), activebackground=p.get("border", "#c5ccd6"), font=("Segoe UI Semibold", 12), padx=16, pady=9, relief="solid", borderwidth=1, highlightthickness=0).pack(side="right")
         text.bind("<Control-a>", select_all)
         text.bind("<Control-A>", select_all)
         text.bind("<Control-c>", copy_error)
@@ -3962,17 +4257,26 @@ class App(tk.Tk):
         style = ttk.Style(self)
         style.configure("TFrame", background=p["bg"])
         style.configure("Card.TFrame", background=p["card"])
-        style.configure("TLabel", background=p["bg"], foreground=p["fg"], font=("Segoe UI", 10))
-        style.configure("Title.TLabel", background=p["bg"], foreground=p["title"], font=("Segoe UI Semibold", 20))
-        style.configure("Sub.TLabel", background=p["bg"], foreground=p["muted"], font=("Segoe UI", 10))
-        style.configure("Section.TLabel", background=p["card"], foreground=p["title"], font=("Segoe UI Semibold", 12))
-        style.configure("Card.TLabel", background=p["card"], foreground=p["fg"])
-        style.configure("Muted.Card.TLabel", background=p["card"], foreground=p["muted"])
-        style.configure("TEntry", fieldbackground=p["input"], foreground=p["fg"], bordercolor=p["border"])
-        style.configure("TCombobox", fieldbackground=p["input"], background=p["card"], foreground=p["fg"], arrowcolor=p["fg"])
+        style.configure("TLabel", background=p["bg"], foreground=p["fg"], font=("Segoe UI", 13))
+        style.configure("Title.TLabel", background=p["bg"], foreground=p["title"], font=("Segoe UI Semibold", 24))
+        style.configure("Sub.TLabel", background=p["bg"], foreground=p["muted"], font=("Segoe UI", 13))
+        style.configure("Section.TLabel", background=p["card"], foreground=p["title"], font=("Segoe UI Semibold", 15))
+        style.configure("Card.TLabel", background=p["card"], foreground=p["fg"], font=("Segoe UI", 13))
+        style.configure("Muted.Card.TLabel", background=p["card"], foreground=p["muted"], font=("Segoe UI", 12))
+        style.configure("TEntry", fieldbackground=p["input"], foreground=p["fg"], bordercolor=p["border"], font=("Segoe UI", 13), padding=5)
+        style.configure("TCombobox", fieldbackground=p["input"], background=p["card"], foreground=p["fg"], arrowcolor=p["fg"], font=("Segoe UI", 13), padding=5)
         style.map("TCombobox", fieldbackground=[("readonly", p["input"])], foreground=[("readonly", p["fg"])], selectbackground=[("readonly", p["selection"])], selectforeground=[("readonly", p["fg"])])
-        style.configure("Primary.TButton", background=p["accent"], foreground="white")
+        style.configure("TCheckbutton", background=p["card"], foreground=p["fg"], font=("Segoe UI", 13), padding=4)
+        style.map("TCheckbutton", background=[("active", p["card"])], foreground=[("disabled", p["muted"])])
+        style.configure("TButton", background=p["card"], foreground=p["fg"], font=("Segoe UI Semibold", 12), padding=(14, 10))
+        style.map("TButton", background=[("active", p["border"]), ("disabled", p["bg"])], foreground=[("disabled", p["muted"])])
+        style.configure("Primary.TButton", background=p["accent"], foreground="white", font=("Segoe UI Semibold", 12), padding=(14, 10))
         style.map("Primary.TButton", background=[("active", p["accent_active"])])
+        style.configure("Vertical.TScrollbar", background=p["card"], troughcolor=p["bg"], arrowcolor=p["fg"])
+        self.option_add("*TCombobox*Listbox.background", p["input"])
+        self.option_add("*TCombobox*Listbox.foreground", p["fg"])
+        self.option_add("*TCombobox*Listbox.selectBackground", p["selection"])
+        self.option_add("*TCombobox*Listbox.selectForeground", p["fg"])
         for widget in self.winfo_children():
             self._retheme_widgets(widget, previous)
 
@@ -3985,7 +4289,25 @@ class App(tk.Tk):
                 widget.configure(bg=p["bg"])
             elif isinstance(widget, tk.Label):
                 current_bg = str(widget.cget("bg"))
-                widget.configure(bg=p["card"] if current_bg.lower() in ("white", "#ffffff") else p["bg"], fg=p["muted"] if str(widget.cget("fg")).lower() in ("#62738a", "#6c7b8d") else p["fg"])
+                next_bg = p["card"] if current_bg.lower() == str(previous.get("card", "#ffffff")).lower() else p["bg"]
+                old_fg = str(widget.cget("fg")).lower()
+                if old_fg == str(previous.get("muted", "#62738a")).lower():
+                    next_fg = p["muted"]
+                elif old_fg == str(previous.get("title", "#172b4d")).lower():
+                    next_fg = p["title"]
+                else:
+                    next_fg = p["fg"]
+                widget.configure(bg=next_bg, fg=next_fg)
+            elif isinstance(widget, tk.Text):
+                widget.configure(bg=p["card"], fg=p["fg"], insertbackground=p["fg"], selectbackground=p["selection"], selectforeground=p["fg"])
+            elif isinstance(widget, tk.Entry):
+                widget.configure(bg=p["input"], fg=p["fg"], insertbackground=p["fg"], selectbackground=p["selection"], selectforeground=p["fg"])
+            elif isinstance(widget, tk.Button):
+                current_bg = str(widget.cget("bg")).lower()
+                if current_bg == str(previous.get("accent", "#1261a0")).lower():
+                    widget.configure(bg=p["accent"], activebackground=p["accent_active"], fg="#ffffff", activeforeground="#ffffff")
+                else:
+                    widget.configure(bg=p["card"], activebackground=p["border"], fg=p["fg"], activeforeground=p["fg"])
         except tk.TclError:
             pass
         for child in widget.winfo_children():
@@ -3993,8 +4315,14 @@ class App(tk.Tk):
         self._theme_widgets_applied = True
 
     def _refresh_system_theme(self):
-        self._apply_theme(self._system_dark_mode())
+        if self.theme_mode == "Auto":
+            self._apply_theme(self._system_dark_mode())
         self.after(1600, self._refresh_system_theme)
+
+    def _on_theme_selected(self, _event=None):
+        mode = self.theme_mode_var.get().strip()
+        self.theme_mode = mode if mode in {"Auto", "Light", "Dark"} else "Auto"
+        self._apply_theme(self._system_dark_mode() if self.theme_mode == "Auto" else self.theme_mode == "Dark")
 
     def _mousewheel(self, event):
         widget = self.winfo_containing(event.x_root, event.y_root)
@@ -4014,18 +4342,61 @@ class App(tk.Tk):
                 return "break"
             widget = getattr(widget, "master", None)
 
+    @staticmethod
+    def _machine_columns_for_width(width):
+        if width >= 1400:
+            return 10
+        if width >= 1000:
+            return 5
+        if width >= 780:
+            return 3
+        return 2
+
+    def _on_root_configure(self, event):
+        if event.widget is not self:
+            return
+        width = max(320, event.width - 56)
+        if hasattr(self, "status_label"):
+            wrap = max(340, width - 34)
+            self.previous_info_label.configure(wraplength=wrap)
+            self.status_label.configure(wraplength=wrap)
+            self.application_part_info_label.configure(wraplength=max(320, width - 340))
+            self.session_action_hint.configure(wraplength=max(260, width - 360))
+            self.draft_confirmation_status_label.configure(wraplength=max(280, width - 260))
+        columns = self._machine_columns_for_width(event.width)
+        if columns != self._machine_layout_columns:
+            self._machine_layout_columns = columns
+            if not self._root_resize_pending:
+                self._root_resize_pending = True
+                self.after_idle(self._finish_responsive_resize)
+
+    def _finish_responsive_resize(self):
+        self._root_resize_pending = False
+        if hasattr(self, "machine_rows") and hasattr(self, "machine_field_frame"):
+            self._render_machine_fields()
+
     def _build(self):
         outer = ttk.Frame(self, padding=22)
         outer.pack(fill="both", expand=True)
-        ttk.Label(outer, text="TN Stamping Assistant", style="Title.TLabel").pack(anchor="w")
+        header = ttk.Frame(outer)
+        header.pack(fill="x")
+        ttk.Label(header, text="TN Stamping Assistant", style="Title.TLabel").pack(side="left", anchor="w")
+        ttk.Label(header, text="Theme", style="TLabel").pack(side="right", padx=(10, 6))
+        self.theme_mode_var = tk.StringVar(value="Auto")
+        self.theme_selector = ttk.Combobox(header, textvariable=self.theme_mode_var, values=("Auto", "Light", "Dark"), state="readonly", width=10)
+        self.theme_selector.pack(side="right")
+        self.theme_selector.bind("<<ComboboxSelected>>", self._on_theme_selected)
         ttk.Label(outer, text="Read a previous certificate, prepare the stamping form, and review before submission.", style="Sub.TLabel").pack(anchor="w", pady=(2, 16))
         canvas = tk.Canvas(outer, bg=self.palette["bg"], highlightthickness=0)
         scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
         body = ttk.Frame(canvas)
         body.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=body, anchor="nw", width=960)
+        self.body_window_id = canvas.create_window((0, 0), window=body, anchor="nw", width=960)
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(self.body_window_id, width=max(320, event.width)))
         canvas.configure(yscrollcommand=scrollbar.set)
         self.scroll_canvas = canvas
+        self.body_frame = body
+        self.bind("<Configure>", self._on_root_configure, add="+")
         self.bind_all("<MouseWheel>", self._mousewheel)
         self.bind_all("<Button-4>", self._mousewheel)
         self.bind_all("<Button-5>", self._mousewheel)
@@ -4037,7 +4408,7 @@ class App(tk.Tk):
         self.user_var = tk.StringVar(); self.pass_var = tk.StringVar()
         self.account_var = tk.StringVar()
         self.business_var = tk.StringVar(); self.contact_var = tk.StringVar(); self.mobile_var = tk.StringVar(); self.trader_contact_var = tk.StringVar()
-        self.account_combo = ttk.Combobox(row, textvariable=self.account_var, state="readonly", width=48)
+        self.account_combo = ttk.Combobox(row, textvariable=self.account_var, state="readonly", width=24)
         self.account_combo.pack(side="left", fill="x", expand=True)
         self.account_combo.bind("<<ComboboxSelected>>", self._on_account_selected)
         ttk.Button(row, text="Add account", command=self.add_account, style="Primary.TButton").pack(side="left", padx=(10, 0))
@@ -4046,10 +4417,17 @@ class App(tk.Tk):
         docs = self._card(body, "Documents")
         self._file_row(docs, "Purchase invoice / Previous CV (PDF)", "certificate", ("PDF files", "*.pdf"))
         self._file_row(docs, "Authorisation letter from user / owner", "authorization", ("PDF or image", "*.pdf *.jpg *.jpeg *.png"))
+        self.use_different_address_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            docs, text="Use different address", variable=self.use_different_address_var,
+            command=self._on_address_source_changed,
+        ).pack(anchor="w", pady=(10, 0))
+        self._file_row(docs, "Address source PDF", "address_source", ("PDF files", "*.pdf"), enabled=False)
         ttk.Label(docs, text="PAN card image is uploaded from the selected account. Portal file uploads must be under 1 MB.", style="Muted.Card.TLabel").pack(anchor="w", pady=(8, 0))
 
         first_page = self._card(body, "Application review — applicant and first page")
-        ttk.Button(first_page, text="Read PDF and fill draft", command=self.read_pdf, style="Primary.TButton").pack(anchor="w", pady=(8, 6))
+        self.read_pdf_button = ttk.Button(first_page, text="Read PDF and fill draft", command=self.read_pdf, style="Primary.TButton")
+        self.read_pdf_button.pack(anchor="w", pady=(8, 6))
         choice_row = ttk.Frame(first_page, style="Card.TFrame")
         choice_row.pack(fill="x", pady=(4, 8))
         self.stamping_place_var = tk.StringVar(value="Select")
@@ -4068,12 +4446,26 @@ class App(tk.Tk):
 
         machine = self._card(body, "Machine details — certificate table")
         ttk.Label(machine, text="Review or correct each machine row read from the certificate pages.", style="Muted.Card.TLabel").pack(anchor="w", pady=(4, 8))
+        self.application_part_row = ttk.Frame(machine, style="Card.TFrame")
+        ttk.Label(self.application_part_row, text="Application part", style="Card.TLabel").pack(side="left", padx=(0, 8))
+        self.application_part_var = tk.StringVar(value="Part 1 of 1")
+        self.application_part_combo = ttk.Combobox(
+            self.application_part_row, textvariable=self.application_part_var,
+            state="readonly", width=24,
+        )
+        self.application_part_combo.pack(side="left")
+        self.application_part_combo.bind("<<ComboboxSelected>>", self._on_application_part_changed)
+        self.application_part_status = tk.StringVar(value="")
+        self.application_part_info_label = ttk.Label(self.application_part_row, textvariable=self.application_part_status,
+                                                     style="Muted.Card.TLabel", wraplength=600)
+        self.application_part_info_label.pack(side="left", padx=(10, 0))
         self.machine_field_frame = ttk.Frame(machine, style="Card.TFrame")
         self.machine_field_frame.pack(fill="x")
         previous_info = self._card(body, "Previous Information")
         self.previous_info_status = tk.StringVar(value="No Previous Information errors.")
-        ttk.Label(previous_info, textvariable=self.previous_info_status, style="Muted.Card.TLabel",
-                  wraplength=930, justify="left").pack(anchor="w", pady=(8, 0))
+        self.previous_info_label = ttk.Label(previous_info, textvariable=self.previous_info_status, style="Muted.Card.TLabel",
+                                             wraplength=930, justify="left")
+        self.previous_info_label.pack(anchor="w", pady=(8, 0))
         self.pan_name = tk.StringVar(); self.pan_number = tk.StringVar(); self.pan_date = tk.StringVar(); self.license_number = tk.StringVar()
         self.repairer_establishment_var = tk.StringVar()
         self._set_fields({})
@@ -4081,13 +4473,37 @@ class App(tk.Tk):
         action = ttk.Frame(body, style="Card.TFrame", padding=14); action.pack(fill="x", pady=(12, 5))
         self.draft_confirmed = tk.BooleanVar(value=False)
         self.draft_confirmation_status = tk.StringVar(value="Review the PDF draft and confirm before starting.")
-        ttk.Button(action, text="Confirm draft is ready", command=self.confirm_draft).pack(side="left", padx=(0, 8))
-        ttk.Label(action, textvariable=self.draft_confirmation_status, style="Muted.Card.TLabel").pack(side="left", padx=(4, 12))
-        ttk.Button(action, text="Start application", command=self.open_portal, style="Primary.TButton").pack(side="left", padx=(0, 8))
-        ttk.Button(action, text="Fill now / retry", command=self.fill_application).pack(side="left", padx=8)
-        ttk.Button(action, text="Submit application", command=self.submit_application).pack(side="left", padx=8)
+        confirm_row = ttk.Frame(action, style="Card.TFrame")
+        confirm_row.pack(fill="x", pady=(0, 8))
+        ttk.Button(confirm_row, text="Confirm draft is ready", command=self.confirm_draft).pack(side="left", padx=(0, 8))
+        self.draft_confirmation_status_label = ttk.Label(confirm_row, textvariable=self.draft_confirmation_status, style="Muted.Card.TLabel", wraplength=680)
+        self.draft_confirmation_status_label.pack(side="left", fill="x", expand=True, padx=(4, 12))
+        action_buttons = ttk.Frame(action, style="Card.TFrame")
+        action_buttons.pack(fill="x")
+        ttk.Button(action_buttons, text="Start application", command=self.open_portal, style="Primary.TButton").pack(side="left", padx=(0, 8))
+        ttk.Button(action_buttons, text="Fill now / retry", command=self.fill_application).pack(side="left", padx=8)
+        ttk.Button(action_buttons, text="Submit application", command=self.submit_application).pack(side="left", padx=8)
+        session_action = ttk.Frame(body, style="Card.TFrame", padding=(14, 0, 14, 10))
+        session_action.pack(fill="x", pady=(0, 4))
+        session_buttons_row = ttk.Frame(session_action, style="Card.TFrame")
+        session_buttons_row.pack(fill="x")
+        self.new_application_button = ttk.Button(
+            session_buttons_row, text="New application (keep signed-in session)",
+            command=self.start_new_application_in_session,
+        )
+        self.new_application_button.pack(side="left")
+        self.session_action_hint = ttk.Label(
+            session_action, text="Uses the current Chromium login and opens a fresh New Stamping form.",
+            style="Muted.Card.TLabel", wraplength=600,
+        )
+        self.session_action_hint.pack(fill="x", anchor="w", pady=(6, 0))
+        self.start_all_parts_button = ttk.Button(
+            session_buttons_row, text="Start all parts (same login)",
+            command=self.start_all_application_parts,
+        )
         self.status = tk.StringVar(value="Ready. Choose documents, review the PDF draft, then open the portal.")
-        ttk.Label(body, textvariable=self.status, style="Sub.TLabel", wraplength=930).pack(anchor="w", pady=(10, 0))
+        self.status_label = ttk.Label(body, textvariable=self.status, style="Sub.TLabel", wraplength=930)
+        self.status_label.pack(anchor="w", pady=(10, 0))
 
     def _card(self, parent, title):
         card = ttk.Frame(parent, style="Card.TFrame", padding=16)
@@ -4095,19 +4511,36 @@ class App(tk.Tk):
         ttk.Label(card, text=title, style="Section.TLabel").pack(anchor="w")
         return card
 
-    def _file_row(self, parent, label, key, file_filter):
+    def _file_row(self, parent, label, key, file_filter, enabled=True):
         frame = ttk.Frame(parent, style="Card.TFrame"); frame.pack(fill="x", pady=(8, 0))
         ttk.Label(frame, text=label, width=40, style="Card.TLabel").pack(side="left")
         display = tk.StringVar(value="No file selected")
         self.files[key + "_display"] = display
         ttk.Label(frame, textvariable=display, style="Muted.Card.TLabel").pack(side="left", fill="x", expand=True, padx=8)
-        ttk.Button(frame, text="Choose file", command=lambda: self.choose_file(key, file_filter)).pack(side="right")
+        button = ttk.Button(frame, text="Choose file", command=lambda: self.choose_file(key, file_filter), state="normal" if enabled else "disabled")
+        button.pack(side="right")
+        self.file_buttons[key] = button
+
+    def _on_address_source_changed(self):
+        enabled = bool(self.use_different_address_var.get())
+        button = self.file_buttons.get("address_source")
+        if button is not None:
+            button.configure(state="normal" if enabled else "disabled")
+        if hasattr(self, "draft_confirmed"):
+            self.draft_confirmed.set(False)
+            self.draft_confirmation_status.set("Address source changed; reread and confirm the draft.")
+        if enabled and not self.files.get("address_source"):
+            self.status.set("Choose an address PDF, then select Read PDF and fill draft to apply its address fields.")
+        else:
+            self.status.set("Address source changed. Select Read PDF and fill draft to refresh the address values.")
 
     def choose_file(self, key, file_filter):
         path = filedialog.askopenfilename(filetypes=[file_filter, ("All files", "*.*")])
         if path:
             self.files[key] = path
             self.files[key + "_display"].set(Path(path).name)
+            if key == "address_source":
+                self._on_address_source_changed()
 
     def _set_fields(self, values, machine_data=None):
         for frame in (self.first_page_field_frame, self.machine_field_frame):
@@ -4140,28 +4573,19 @@ class App(tk.Tk):
             "Verification interval (e/d)": "e/d", "Instrument model": "Model",
             "Machine number": "Machine number", "Class": "Class", "Quantity": "Qty",
         }
-        for col, name in enumerate(machine_keys):
-            ttk.Label(self.machine_field_frame, text=machine_headers.get(name, name), style="Card.TLabel", wraplength=105, anchor="center").grid(row=0, column=col, sticky="nsew", padx=2, pady=(0, 4))
-            self.machine_field_frame.columnconfigure(col, weight=1, uniform="machine")
+        self.machine_display_keys = machine_keys
+        self.machine_display_headers = machine_headers
         records = machine_data or [{name: values.get(name, "") for name in machine_keys}]
         for machine_index, record in enumerate(records):
-            label_row = 1 + machine_index * 2
-            field_row = label_row + 1
-            machine_type = record.get("Instrument description", "")
-            certificate_no = record.get("Previous CV number", "")
-            title = f"Machine {machine_index + 1}" + (f" — {machine_type}" if machine_type else "")
-            if certificate_no:
-                title += f" (CV {certificate_no})"
-            ttk.Label(self.machine_field_frame, text=title, style="Muted.Card.TLabel", wraplength=920, justify="left").grid(row=label_row, column=0, columnspan=len(machine_keys), sticky="w", padx=2, pady=(6, 0))
             row_vars = {}
-            for col, name in enumerate(machine_keys):
+            for name in machine_keys:
                 var = tk.StringVar(value=record.get(name, ""))
                 row_vars[name] = var
-                ttk.Entry(self.machine_field_frame, textvariable=var, width=11).grid(row=field_row, column=col, sticky="ew", padx=2, pady=2)
                 if machine_index == 0:
                     self.vars[name] = var
             self.machine_rows.append(row_vars)
             self.machine_metadata.append({key: value for key, value in record.items() if key not in machine_keys})
+        self._render_machine_fields()
         for name in FIELD_LABELS:
             if name in MACHINE_REVIEW_FIELDS:
                 continue
@@ -4170,7 +4594,7 @@ class App(tk.Tk):
             var = tk.StringVar(value=values.get(name, ""))
             self.vars[name] = var
             ttk.Label(frame, text=name, style="Card.TLabel").grid(row=idx, column=0, sticky="w", pady=3, padx=(0, 10))
-            ttk.Entry(frame, textvariable=var, width=75).grid(row=idx, column=1, sticky="ew", pady=3)
+            ttk.Entry(frame, textvariable=var, width=48).grid(row=idx, column=1, sticky="ew", pady=3)
             first_idx += 1
         self.first_page_field_frame.columnconfigure(1, weight=1)
         if self.pan_name.get(): self.vars["PAN name"].set(self.pan_name.get())
@@ -4178,45 +4602,214 @@ class App(tk.Tk):
         if self.pan_date.get(): self.vars["PAN date"].set(self.pan_date.get())
         if self.license_number.get(): self.vars["Repairer licence number"].set(self.license_number.get())
 
+    def _render_machine_fields(self):
+        if not hasattr(self, "machine_field_frame") or not hasattr(self, "machine_display_keys"):
+            return
+        for widget in self.machine_field_frame.winfo_children():
+            widget.destroy()
+        columns = self._machine_layout_columns or self._machine_columns_for_width(self.winfo_width())
+        keys = self.machine_display_keys
+        headers = self.machine_display_headers
+        for col in range(max(10, columns)):
+            self.machine_field_frame.columnconfigure(col, weight=0, uniform="")
+        for col in range(columns):
+            self.machine_field_frame.columnconfigure(col, weight=1, uniform="machine-fields")
+        compact = columns < len(keys)
+        if not compact:
+            for col, name in enumerate(keys):
+                ttk.Label(
+                    self.machine_field_frame, text=headers.get(name, name), style="Card.TLabel",
+                    wraplength=max(75, int(self.winfo_width() / columns) - 12), anchor="center",
+                ).grid(row=0, column=col, sticky="nsew", padx=3, pady=(0, 5))
+            for machine_index, row_vars in enumerate(self.machine_rows):
+                label_row = 1 + machine_index * 2
+                field_row = label_row + 1
+                metadata = self.machine_metadata[machine_index] if machine_index < len(self.machine_metadata) else {}
+                machine_type = row_vars.get("Instrument description").get() if row_vars.get("Instrument description") else ""
+                certificate_no = metadata.get("Previous CV number", "")
+                title = f"Machine {machine_index + 1}" + (f" — {machine_type}" if machine_type else "")
+                if certificate_no:
+                    title += f" (CV {certificate_no})"
+                ttk.Label(self.machine_field_frame, text=title, style="Muted.Card.TLabel", wraplength=max(500, self.winfo_width() - 100), justify="left").grid(row=label_row, column=0, columnspan=columns, sticky="w", padx=3, pady=(8, 1))
+                for col, name in enumerate(keys):
+                    ttk.Entry(self.machine_field_frame, textvariable=row_vars[name], width=11).grid(row=field_row, column=col, sticky="ew", padx=3, pady=3)
+            return
+
+        rows_per_machine = math.ceil(len(keys) / columns) * 2 + 1
+        for machine_index, row_vars in enumerate(self.machine_rows):
+            base_row = machine_index * rows_per_machine
+            metadata = self.machine_metadata[machine_index] if machine_index < len(self.machine_metadata) else {}
+            machine_type = row_vars.get("Instrument description").get() if row_vars.get("Instrument description") else ""
+            certificate_no = metadata.get("Previous CV number", "")
+            title = f"Machine {machine_index + 1}" + (f" — {machine_type}" if machine_type else "")
+            if certificate_no:
+                title += f" (CV {certificate_no})"
+            ttk.Label(self.machine_field_frame, text=title, style="Muted.Card.TLabel", wraplength=max(350, self.winfo_width() - 100), justify="left").grid(row=base_row, column=0, columnspan=columns, sticky="w", padx=3, pady=(8, 2))
+            for index, name in enumerate(keys):
+                row_offset = 1 + (index // columns) * 2
+                col = index % columns
+                cell_width = max(160, int((self.winfo_width() - 100) / columns))
+                ttk.Label(self.machine_field_frame, text=headers.get(name, name), style="Card.TLabel", wraplength=cell_width - 12).grid(row=base_row + row_offset, column=col, sticky="w", padx=3, pady=(3, 0))
+                ttk.Entry(self.machine_field_frame, textvariable=row_vars[name], width=14).grid(row=base_row + row_offset + 1, column=col, sticky="ew", padx=3, pady=(0, 4))
+
     def read_pdf(self):
         path = self.files.get("certificate")
         if not path:
             messagebox.showerror("Previous certificate required", "Select the previous CV or purchase invoice PDF first.")
             return
+        use_address_source = bool(self.use_different_address_var.get())
+        address_path = self.files.get("address_source", "") if use_address_source else ""
+        if use_address_source and not address_path:
+            messagebox.showerror("Address PDF required", "Select an address source PDF or turn off Use different address.")
+            return
+        if self._pdf_reading:
+            return
+        self._pdf_reading = True
+        self._pdf_read_generation += 1
+        generation = self._pdf_read_generation
+        self.read_pdf_button.configure(state="disabled")
+        self.status.set(f"Reading {Path(path).name} in the background. You can continue scrolling while it is processed.")
+        threading.Thread(
+            target=self._read_pdf_background,
+            args=(path, generation, address_path),
+            name="CertificateReader",
+            daemon=True,
+        ).start()
+
+    def _read_pdf_background(self, path, generation, address_path=""):
+        """Parse the machine CV and optional address source off the Tk thread."""
         try:
-            page_count, meaningful_page_count, values, machines = extract_certificate_document(path)
-            if not machines:
-                messagebox.showerror("No selectable text found", "This PDF appears to be a scan. Use a text-searchable PDF; OCR is not included in this local build.")
-                return
-            account_index = self.account_combo.current()
-            account = self.accounts[account_index] if 0 <= account_index < len(self.accounts) else {}
-            repairer_company = str(account.get("repairer_company_name") or "").strip() or values.get("Repairer business name", "").strip()
-            repairer_mobile = str(account.get("repairer_mobile") or "").strip() or values.get("Repairer mobile", "").strip()
-            repairer_contact = ", ".join(part for part in (repairer_company, repairer_mobile) if part)
-            # When the selected account has no repairer identity saved yet,
-            # learn it from this certificate and store it with that account.
-            # Existing saved values are never overwritten by another PDF.
-            if account_index >= 0 and account and (repairer_company or repairer_mobile):
-                changed = False
-                if repairer_company and not account.get("repairer_company_name"):
-                    account["repairer_company_name"] = repairer_company
-                    changed = True
-                if repairer_mobile and not account.get("repairer_mobile"):
-                    account["repairer_mobile"] = repairer_mobile
-                    changed = True
-                if changed:
-                    self.profile["portal_accounts"] = self.accounts
-                    try:
-                        save_vault(self.profile)
-                    except Exception as exc:
-                        self._show_copyable_error("Could not save repairer profile details", str(exc))
-            values.update({"Applicant business name": values.get("Applicant / establishment name", ""), "Applicant contact name": self.contact_var.get(), "Registered name": self.contact_var.get(), "Registered email": self.user_var.get(), "Registered mobile": self.mobile_var.get(), "Used by / trader contact": repairer_contact, "PAN name": self.pan_name.get(), "PAN number": self.pan_number.get(), "PAN date": self.pan_date.get(), "Repairer name": self.pan_name.get(), "Repairer licence number": self.license_number.get()})
-            self.repairer_establishment_var.set(repairer_contact)
+            parsed = extract_certificate_document(path)
+            if address_path:
+                page_count, meaningful_page_count, values, machines = parsed
+                address_fields = extract_address_document(address_path)
+                # Address source PDFs control address values only. Keep the
+                # main Previous CV as the source for every machine and CV field.
+                values.update(address_fields)
+                parsed = page_count, meaningful_page_count, values, machines
+            self.pdf_msgq.put(("parsed", (generation, path, address_path, parsed)))
+        except Exception as exc:
+            self.pdf_msgq.put(("error", (generation, path, address_path, str(exc))))
+
+    def _finish_pdf_read(self, kind, result):
+        generation, path, address_path, payload = result
+        if generation != self._pdf_read_generation:
+            return
+        self._pdf_reading = False
+        self.read_pdf_button.configure(state="normal")
+        if path != self.files.get("certificate"):
+            self.status.set("The selected certificate changed while it was being read. Select Read PDF and fill draft again.")
+            return
+        current_address_path = self.files.get("address_source", "") if self.use_different_address_var.get() else ""
+        if address_path != current_address_path:
+            self.status.set("The address source changed while the PDF was being read. Select Read PDF and fill draft again.")
+            return
+        if kind == "error":
+            self._show_copyable_error("Could not read PDF", payload)
+            return
+        page_count, meaningful_page_count, values, machines = payload
+        if not machines:
+            messagebox.showerror("No selectable text found", "This PDF appears to be a scan. Use a text-searchable PDF; OCR is not included in this local build.")
+            return
+        account_index = self.account_combo.current()
+        account = self.accounts[account_index] if 0 <= account_index < len(self.accounts) else {}
+        repairer_company = str(account.get("repairer_company_name") or "").strip() or values.get("Repairer business name", "").strip()
+        repairer_mobile = str(account.get("repairer_mobile") or "").strip() or values.get("Repairer mobile", "").strip()
+        repairer_contact = ", ".join(part for part in (repairer_company, repairer_mobile) if part)
+        if account_index >= 0 and account and (repairer_company or repairer_mobile):
+            changed = False
+            if repairer_company and not account.get("repairer_company_name"):
+                account["repairer_company_name"] = repairer_company
+                changed = True
+            if repairer_mobile and not account.get("repairer_mobile"):
+                account["repairer_mobile"] = repairer_mobile
+                changed = True
+            if changed:
+                self.profile["portal_accounts"] = self.accounts
+                try:
+                    save_vault(self.profile)
+                except Exception as exc:
+                    self._show_copyable_error("Could not save repairer profile details", str(exc))
+        values.update({"Applicant business name": values.get("Applicant / establishment name", ""), "Applicant contact name": self.contact_var.get(), "Registered name": self.contact_var.get(), "Registered email": self.user_var.get(), "Registered mobile": self.mobile_var.get(), "Used by / trader contact": repairer_contact, "PAN name": self.pan_name.get(), "PAN number": self.pan_number.get(), "PAN date": self.pan_date.get(), "Repairer name": self.pan_name.get(), "Repairer licence number": self.license_number.get()})
+        self.repairer_establishment_var.set(repairer_contact)
+        self.application_part_states = self._create_application_parts(values, machines)
+        self.active_application_part = 0
+        part_labels = [f"Part {index + 1} of {len(self.application_part_states)} ({len(part['machines'])} machines)"
+                       for index, part in enumerate(self.application_part_states)]
+        self.application_part_combo.configure(values=part_labels)
+        self.application_part_var.set(part_labels[0] if part_labels else "Part 1 of 1")
+        if len(self.application_part_states) > 1:
+            self.application_part_row.pack(fill="x", pady=(0, 8))
+            self.start_all_parts_button.pack(side="right")
+            sizes = " + ".join(str(len(part["machines"])) for part in self.application_part_states)
+            self.application_part_status.set(
+                f"{len(machines)} machines split into {len(self.application_part_states)} separate applications ({sizes}). "
+                "Complete and submit each part separately; choose the next part here and reuse the signed-in session."
+            )
+        else:
+            self.application_part_row.pack_forget()
+            self.start_all_parts_button.pack_forget()
+            self.application_part_status.set("")
+        if self.application_part_states:
+            first_part = self.application_part_states[0]
+            self._set_fields(first_part["fields"], first_part["machines"])
+        else:
             self._set_fields(values, machines)
-            ignored = page_count - meaningful_page_count
-            self.status.set(f"Draft read from {Path(path).name}: {page_count} pages, {len(machines)} machine(s), {ignored} blank/footer page(s) ignored. Review every value before filling the portal.")
-        except Exception as e:
-            self._show_copyable_error("Could not read PDF", str(e))
+        ignored = page_count - meaningful_page_count
+        address_note = f" Address fields read from {Path(address_path).name}." if address_path else " Address fields read from the Previous CV PDF."
+        split_note = f" Split into {len(self.application_part_states)} application parts; review each part separately." if len(self.application_part_states) > 1 else ""
+        self.status.set(f"Draft read from {Path(path).name}: {page_count} pages, {len(machines)} machine(s), {ignored} blank/footer page(s) ignored.{split_note}{address_note} Review every value before filling the portal.")
+
+    def _create_application_parts(self, values, machines):
+        sizes = plan_machine_parts(len(machines))
+        if not sizes:
+            return []
+        parts = []
+        start = 0
+        for size in sizes:
+            records = [dict(record) for record in machines[start:start + size]]
+            start += size
+            part_values = dict(values)
+            first_machine = records[0]
+            # Each separate portal application must show the CV and date from
+            # the first machine page included in that part.
+            if first_machine.get("Previous CV number"):
+                part_values["Previous CV number"] = first_machine["Previous CV number"]
+            if first_machine.get("Previous CV date"):
+                part_values["Previous CV date"] = first_machine["Previous CV date"]
+            if first_machine.get("Application number"):
+                part_values["Application number"] = first_machine["Application number"]
+            parts.append({"fields": part_values, "machines": records})
+        return parts
+
+    def _store_active_application_part(self):
+        if not self.application_part_states or not (0 <= self.active_application_part < len(self.application_part_states)):
+            return
+        state = self.application_part_states[self.active_application_part]
+        state["fields"] = {
+            key: variable.get().strip()
+            for key, variable in self.vars.items()
+            if key not in MACHINE_REVIEW_FIELDS
+        }
+        edited_machines = []
+        for index, row in enumerate(self.machine_rows):
+            record = dict(self.machine_metadata[index]) if index < len(self.machine_metadata) else {}
+            record.update({key: variable.get().strip() for key, variable in row.items()})
+            edited_machines.append(record)
+        if edited_machines:
+            state["machines"] = edited_machines
+
+    def _on_application_part_changed(self, _event=None):
+        if len(self.application_part_states) < 2:
+            return
+        selected = self.application_part_combo.current()
+        if selected < 0 or selected >= len(self.application_part_states) or selected == self.active_application_part:
+            return
+        self._store_active_application_part()
+        self.active_application_part = selected
+        state = self.application_part_states[selected]
+        self._set_fields(state["fields"], state["machines"])
+        self.draft_confirmation_status.set("Application part changed; review its address and machine rows, then confirm it.")
 
     def _load_profile(self):
         self.accounts = list(self.profile.get("portal_accounts", []))
@@ -4479,8 +5072,77 @@ class App(tk.Tk):
             self.status.set(f"Could not start Chromium: {exc}")
             self._show_copyable_error("Could not start Chromium", str(exc))
 
-    def _application_payload(self):
-        fields = {k: v.get().strip() for k, v in self.vars.items()}
+    def start_new_application_in_session(self):
+        self._on_account_selected()
+        if not self.user_var.get() or not self.pass_var.get():
+            messagebox.showerror("Sign-in details needed", "Choose an email from the saved account dropdown first.")
+            return
+        if not self.files.get("certificate") or not self.machine_rows:
+            messagebox.showerror("PDF draft required", "Choose the Previous CV PDF and select Read PDF and fill draft first.")
+            return
+        if not self._validate_draft_confirmation():
+            return
+        if not messagebox.askyesno(
+            "Start another stamping application",
+            "This will leave the current portal page and open a fresh New Stamping form in the already signed-in Chromium session. The current application will not be submitted. Continue?",
+        ):
+            return
+        self._ensure_worker()
+        payload = self._application_payload()
+        payload["credentials"] = {"username": self.user_var.get(), "password": self.pass_var.get()}
+        try:
+            self.worker.send("new_application", payload)
+            self.status.set("Reusing the current signed-in Chromium session and opening a fresh New Stamping form.")
+        except Exception as exc:
+            self.status.set(f"Could not start a new application in the current session: {exc}")
+            self._show_copyable_error("Could not reuse signed-in session", str(exc))
+
+    def start_all_application_parts(self):
+        self._on_account_selected()
+        if not self.user_var.get() or not self.pass_var.get():
+            messagebox.showerror("Sign-in details needed", "Choose an email from the saved account dropdown first.")
+            return
+        if len(self.application_part_states) < 2:
+            messagebox.showerror("No split parts", "Read a PDF with more than 40 machine records first.")
+            return
+        if self.active_application_part != 0:
+            messagebox.showerror("Select Part 1", "Choose Part 1 and confirm its draft before starting the complete split application.")
+            return
+        if not self._validate_draft_confirmation():
+            return
+        if not messagebox.askyesno(
+            "Apply all split parts",
+            f"The {len(self.application_part_states)} parts will be opened in separate tabs in one signed-in Chromium session. Complete CAPTCHA once. Each part will stop at its final review and wait for your Submit confirmation; the next part opens after submission. Payment remains manual. Continue?",
+        ):
+            return
+        try:
+            applications = [self._application_payload(index) for index in range(len(self.application_part_states))]
+            self._ensure_worker()
+            self.worker.send("apply_all_parts", {
+                "applications": applications,
+                "credentials": {"username": self.user_var.get(), "password": self.pass_var.get()},
+            })
+            self.status.set("Preparing every application part in the same Chromium login session.")
+        except Exception as exc:
+            self.status.set(f"Could not start all application parts: {exc}")
+            self._show_copyable_error("Could not start split applications", str(exc))
+
+    def _application_payload(self, part_index=None):
+        if part_index is not None and self.application_part_states:
+            self._store_active_application_part()
+            if part_index < 0 or part_index >= len(self.application_part_states):
+                raise IndexError("Application part selection is invalid.")
+            part = self.application_part_states[part_index]
+            fields = dict(part["fields"])
+            source_machine_rows = [dict(row) for row in part["machines"]]
+        else:
+            fields = {k: v.get().strip() for k, v in self.vars.items()}
+            source_machine_rows = []
+            for index, row in enumerate(self.machine_rows):
+                item = {key: value.get().strip() for key, value in row.items()}
+                if index < len(self.machine_metadata):
+                    item.update(self.machine_metadata[index])
+                source_machine_rows.append(item)
         fields["Stamping office/site"] = self.stamping_place_var.get().strip()
         fields["Dormant / Other"] = self.site_status_var.get().strip() if fields["Stamping office/site"].casefold() == "site" else ""
         # The portal's establishment name is the company name parsed/reviewed
@@ -4515,12 +5177,7 @@ class App(tk.Tk):
             image_bytes = base64.b64decode(encoded)
             image_name = account.get("pan_image_name", "pan-card.jpg")
             image_payload = {"name": image_name, "mimeType": mimetypes.guess_type(image_name)[0] or "image/jpeg", "buffer": image_bytes}
-        machine_rows = []
-        for index, row in enumerate(self.machine_rows):
-            item = {key: value.get().strip() for key, value in row.items()}
-            if index < len(self.machine_metadata):
-                item.update(self.machine_metadata[index])
-            machine_rows.append(item)
+        machine_rows = source_machine_rows
         # Preserve certificate order independently of the item grouping used
         # for the portal's machine tables. Each row carries its own page CV.
         machine_rows.sort(key=lambda row: int(row.get("Source PDF page", 0)))
@@ -4595,6 +5252,12 @@ class App(tk.Tk):
     def _poll(self):
         try:
             while True:
+                pdf_kind, pdf_value = self.pdf_msgq.get_nowait()
+                self._finish_pdf_read(pdf_kind, pdf_value)
+        except queue.Empty:
+            pass
+        try:
+            while True:
                 kind, value = self.msgq.get_nowait()
                 if kind == "error":
                     self.status.set(value)
@@ -4614,6 +5277,26 @@ class App(tk.Tk):
                 elif kind == "login_failed":
                     self.status.set(value); self._show_copyable_error("Sign-in failed", value)
                 elif kind == "ready_to_submit":
+                    self.status.set(value)
+                elif kind == "multi_part_started":
+                    self.application_part_combo.configure(state="disabled")
+                    self.start_all_parts_button.configure(state="disabled")
+                    self.new_application_button.configure(state="disabled")
+                    self.status.set(f"Multi-part run active: {value} applications will use this signed-in Chromium session. Confirm each Submit manually; payment remains manual.")
+                elif kind == "multi_part_part":
+                    part_index, total_parts = value
+                    if 0 <= part_index < len(self.application_part_states) and part_index != self.active_application_part:
+                        self.application_part_combo.configure(state="readonly")
+                        self.application_part_combo.current(part_index)
+                        self._on_application_part_changed()
+                        self.application_part_combo.configure(state="disabled")
+                    self.status.set(f"Filling split application part {part_index + 1} of {total_parts} in the existing signed-in session.")
+                elif kind == "multi_part_done":
+                    self.application_part_combo.configure(state="readonly")
+                    self.start_all_parts_button.configure(state="normal")
+                    self.new_application_button.configure(state="normal")
+                    self.status.set(value)
+                elif kind == "progress":
                     self.status.set(value)
                 else:
                     self.status.set(value)
