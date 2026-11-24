@@ -112,7 +112,7 @@ PORTAL_ID_ALIASES = {
 
 LOCAL_ONLY_FIELDS = {
     "Business address", "Denomination", "Instrument make", "Instrument model", "Machine number",
-    "Maximum capacity", "Minimum capacity", "Verification interval (e/d)", "Class", "Application number", "Dormant / Other",
+    "Maximum capacity", "Minimum capacity", "Verification interval (e/d)", "Class", "Application number", "Dormant / Other", "PAN name",
 }
 
 MACHINE_REVIEW_FIELDS = {
@@ -1444,7 +1444,7 @@ class PortalWorker(threading.Thread):
             for index, machine in enumerate(machines, 1):
                 expected_cv = str(machine.get("Previous CV number", "")).strip()
                 marker = f"Machine {index} Previous CV number"
-                if expected_cv and marker not in filled_machine_cvs:
+                if len(machines) > 1 and expected_cv and marker not in filled_machine_cvs:
                     report["required_blank"].append(
                         f"Previous CV dropdown for machine {index} was not confirmed as {expected_cv}"
                     )
@@ -1478,8 +1478,8 @@ class PortalWorker(threading.Thread):
                         0, "Final machine review failed once; the portal Edit control was used to refill page 2 and review again"
                     )
                     return retry_report
-                report["required_blank"].append(
-                    "Final machine details need correction, but the portal Edit control was not available"
+                report["skipped"].append(
+                    "Automatic Edit control was not available on the final review page; the application was left unsubmitted for manual review"
                 )
             self._verify_final_review_total(machines, report["required_blank"])
         self._collect_visible_required(report)
@@ -1493,19 +1493,24 @@ class PortalWorker(threading.Thread):
         try:
             summaries = self.page.locator("table").all()
             for table in summaries:
-                if "total opted quantity" not in self._norm(table.inner_text()):
+                summary_text = self._norm(table.inner_text())
+                if not re.search(r"total\s+(?:opted\s+)?quantity", summary_text):
                     continue
                 header_cells = []
                 for row in table.locator("tr").all():
                     cells = row.locator("th,td").all()
                     labels = [self._norm(cell.inner_text()) for cell in cells]
-                    if "total quantity" in labels:
+                    quantity_index = next((
+                        index for index, label in enumerate(labels)
+                        if re.fullmatch(r"total\s+(?:opted\s+)?quantity", label)
+                    ), None)
+                    if quantity_index is not None:
                         header_cells = labels
+                        header_quantity_index = quantity_index
                         continue
-                    if not header_cells or len(cells) != len(header_cells):
+                    if not header_cells or len(cells) <= header_quantity_index:
                         continue
-                    quantity_index = header_cells.index("total quantity")
-                    actual = re.sub(r"\D", "", cells[quantity_index].inner_text())
+                    actual = re.sub(r"\D", "", cells[header_quantity_index].inner_text())
                     if actual and int(actual) == expected_total:
                         return
                     if actual:
@@ -1513,6 +1518,23 @@ class PortalWorker(threading.Thread):
                             f"Final review total quantity is {actual}; expected {expected_total}"
                         )
                         return
+            # Some portal versions render the final summary as divs instead
+            # of a semantic table. Read a labeled total from the visible page
+            # before marking the review incomplete.
+            body_text = re.sub(r"\s+", " ", self.page.locator("body").inner_text())
+            match = re.search(r"total\s+(?:opted\s+)?quantity\s*[:\-]?\s*(\d+)\b", body_text, re.I)
+            if match:
+                actual = int(match.group(1))
+                if actual == expected_total:
+                    return
+                required_blank.append(
+                    f"Final review total quantity is {actual}; expected {expected_total}"
+                )
+                return
+            if len(machines) == 1:
+                # A single-machine confirmation can omit the aggregate fee
+                # table; the machine row itself is checked separately.
+                return
             required_blank.append("Final review did not show the expected total quantity summary")
         except Exception as exc:
             required_blank.append(f"Final review total quantity could not be confirmed: {exc}")
@@ -1536,10 +1558,24 @@ class PortalWorker(threading.Thread):
             machine_norm = self._norm(machine_number)
             matched_row = next((row for row in normalized_rows
                                 if cv_norm in row and (not machine_norm or machine_norm in row)), None)
+            if matched_row is None and len(machines) == 1:
+                # A single machine has one possible CV, so the portal may not
+                # expose a selectable CV value in the machine row/review.
+                # Locate its final row by machine number and still validate
+                # the other captured machine details.
+                matched_row = next((row for row in normalized_rows
+                                    if machine_norm and machine_norm in row), None)
+                if matched_row is None:
+                    item_norm = self._norm(machine.get("Instrument description", ""))
+                    matched_row = next((row for row in normalized_rows
+                                        if item_norm and item_norm in row), None)
             if matched_row is None:
-                required_blank.append(
-                    f"Final review did not confirm CV {cv_number} for machine {index}"
-                )
+                if len(machines) == 1:
+                    required_blank.append(f"Final review did not confirm the single machine row for {machine_number or machine.get('Instrument description', '(unavailable)')}")
+                else:
+                    required_blank.append(
+                        f"Final review did not confirm CV {cv_number} for machine {index}"
+                    )
                 continue
 
             # Confirm the final table retained the machine values parsed from
@@ -3476,29 +3512,66 @@ class PortalWorker(threading.Thread):
         page = self.page
         weights_only = bool(machines) and all(_is_weights_item(row.get("Instrument description", "")) for row in machines)
         tables = []
+        table_selector = page.locator("table")
         try:
-            for table in page.locator("table").all():
+            table_candidates = table_selector.all()
+        except Exception:
+            table_candidates = []
+        header_signals = (
+            r"denomination|weight", r"\bclass\b", r"\bmax(?:imum)?\b",
+            r"\bmin(?:imum)?\b", r"e\s*/?\s*d|division|interval",
+            r"make|manufacturer|brand", r"\bmodel\b", r"machine|serial",
+            r"previous\s*cv|certificate\s*(?:no|number)|cv\s*(?:no|number)",
+        )
+        table_previews = []
+        for table in table_candidates:
+            try:
+                if not table.is_visible():
+                    continue
                 rows = table.locator("tr").all()
-                header_row = None
-                headers = []
-                for row in rows[:3]:
+                header_candidates = []
+                for row in rows[:8]:
                     cells = row.locator("th,td").all_inner_texts()
+                    if not cells:
+                        continue
                     joined = self._norm(" ".join(cells))
-                    has_weight_column = bool(re.search(r"denomination|weight", joined, re.I))
-                    if sum(bool(re.search(pattern, joined, re.I)) for pattern in (r"denomination|weight", r"class", r"max", r"min", r"e\s*d|division", r"make|manufacturer", r"model", r"machine|serial")) >= 3 or (weights_only and has_weight_column):
-                        header_row, headers = row, cells
-                        break
-                if header_row is None:
+                    score = sum(bool(re.search(pattern, joined, re.I)) for pattern in header_signals)
+                    header_candidates.append((score, row, cells))
+                if not header_candidates:
+                    continue
+                score, header_row, headers = max(header_candidates, key=lambda item: item[0])
+                has_weight_column = any(re.search(r"denomination|weight", self._norm(cell), re.I) for cell in headers)
+                # Portal revisions sometimes split the machine header across
+                # two header rows. Combine column labels as a fallback while
+                # keeping their original positions for the editable rows.
+                if score < 3 and len(rows) >= 2:
+                    header_rows = []
+                    for row in rows[:8]:
+                        if row.locator("input,select,textarea").count() and not row.locator("th").count():
+                            continue
+                        cells = row.locator("th,td").all_inner_texts()
+                        if cells and any(str(cell).strip() for cell in cells):
+                            header_rows.append(cells)
+                    width = max((len(cells) for cells in header_rows), default=0)
+                    combined = [" ".join(cells[col].strip() for cells in header_rows if col < len(cells) and cells[col].strip()) for col in range(width)]
+                    combined_score = sum(bool(re.search(pattern, self._norm(" ".join(combined)), re.I)) for pattern in header_signals)
+                    if combined_score > score:
+                        score, headers = combined_score, combined
+                if score < 3 and not (weights_only and has_weight_column):
+                    if len(table_previews) < 4:
+                        table_previews.append(" / ".join(re.sub(r"\s+", " ", str(cell)).strip() for cell in headers if str(cell).strip())[:180])
                     continue
                 data_rows = [row for row in rows if row.locator("input,select,textarea").count()]
-                data_rows = [row for row in data_rows if row != header_row]
                 if not data_rows:
                     continue
                 tables.append((table, headers, data_rows))
-        except Exception:
-            tables = []
+            except Exception:
+                # A detached unrelated table must not erase machine tables
+                # already recognized elsewhere on the current page.
+                continue
         if not tables:
-            skipped.append("Machine details: could not identify the portal table columns; review and enter machine rows manually")
+            details = f"; visible table headers: {' | '.join(table_previews)}" if table_previews else ""
+            skipped.append("Machine details: could not identify the portal table columns" + details + "; review and enter machine rows manually")
             return
 
         grouped_rows = [group.get("machines", []) for group in groups]
@@ -3566,6 +3639,23 @@ class PortalWorker(threading.Thread):
             for col, cell in enumerate(cells):
                 header = headers[col] if col < len(headers) else ""
                 field = next((name for name, pattern in pattern_map.items() if re.search(pattern, header, re.I)), None)
+                if field is None:
+                    # Some responsive portal layouts keep the visible column
+                    # heading outside the data row. Use the control's own
+                    # labels/metadata as a safe field-name fallback.
+                    try:
+                        controls_in_cell = cell.locator("input,select,textarea")
+                        for control in controls_in_cell.all():
+                            metadata = control.evaluate("""el => [
+                                ...(el.labels || []).map(label => label.innerText || label.textContent || ''),
+                                el.id || '', el.name || '', el.placeholder || '',
+                                el.getAttribute('aria-label') || '', el.title || ''
+                            ].join(' ')""")
+                            field = next((name for name, pattern in pattern_map.items() if re.search(pattern, metadata or "", re.I)), None)
+                            if field:
+                                break
+                    except Exception:
+                        field = None
                 if not field:
                     continue
                 value = machine.get("Weights", "") or machine.get("Denomination", "") if field == "Denomination" else machine.get(field, "")
@@ -3582,6 +3672,8 @@ class PortalWorker(threading.Thread):
                     continue
                 try:
                     if field == "Previous CV number":
+                        if len(machines) == 1:
+                            continue
                         selected = self._select_previous_cv_option(controls.first, value)
                     else:
                         selected = self._fill_control(controls.first, value)
@@ -3603,6 +3695,8 @@ class PortalWorker(threading.Thread):
                 source_index = flat_row_indices.get(id(flat_rows[row_idx]), row_idx)
                 found = fill_row(row_locator, headers, flat_rows[row_idx], source_index)
                 for key in pattern_map:
+                    if key == "Previous CV number" and len(machines) == 1:
+                        continue
                     if flat_rows[row_idx].get(key) and key not in found:
                         skipped.append(f"Machine {row_idx + 1} {key}")
             if len(data_rows) < len(flat_rows):
@@ -3616,6 +3710,8 @@ class PortalWorker(threading.Thread):
                 global_index = flat_row_indices.get(id(machine), cursor + row_idx)
                 found = fill_row(row_locator, headers, machine, global_index)
                 for key in pattern_map:
+                    if key == "Previous CV number" and len(machines) == 1:
+                        continue
                     if machine.get(key) and key not in found:
                         skipped.append(f"Machine {global_index + 1} {key}")
             cursor += 1
@@ -3627,6 +3723,11 @@ class PortalWorker(threading.Thread):
         target = self._norm(str(certificate_number or ""))
         if not target:
             return False
+        def contains_exact_cv(candidate):
+            normalized = self._norm(str(candidate or ""))
+            return bool(normalized) and re.search(
+                rf"(?<![a-z0-9]){re.escape(target)}(?![a-z0-9])", normalized
+            ) is not None
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
@@ -3641,13 +3742,10 @@ class PortalWorker(threading.Thread):
                 label, value = option["label"], option["value"]
                 if not label or not value or option["disabled"] or label.lower() in {"select", "please select"}:
                     continue
-                normalized_label = self._norm(label)
-                normalized_value = self._norm(value)
                 # The portal appends a certificate date to each dropdown
-                # label, so match the whole CV number followed by a boundary.
-                # This prevents a shorter number matching a longer one.
-                if (normalized_label == target or normalized_label.startswith(target + " ")
-                        or normalized_value == target or normalized_value.startswith(target + " ")):
+                # label (and some builds prefix metadata). Match the exact CV
+                # token sequence anywhere without accepting a longer CV.
+                if contains_exact_cv(label) or contains_exact_cv(value):
                     choices.append((label, value))
             # Require one exact certificate match; partial CV matches can pick
             # the wrong machine when the certificates differ only at the end.
@@ -3657,10 +3755,7 @@ class PortalWorker(threading.Thread):
                         r"\s+", " ", control.locator("option:checked").first.inner_text()
                     ).strip()
                     selected_value = control.input_value().strip()
-                    normalized_label = self._norm(selected_label)
-                    normalized_value = self._norm(selected_value)
-                    if (normalized_label == target or normalized_label.startswith(target + " ")
-                            or normalized_value == target or normalized_value.startswith(target + " ")):
+                    if contains_exact_cv(selected_label) or contains_exact_cv(selected_value):
                         return True
                 except Exception:
                     pass
