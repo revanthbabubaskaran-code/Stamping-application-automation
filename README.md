@@ -54,6 +54,8 @@ python stamping_assistant.py
 
 Use the mouse wheel or the vertical scrollbar to navigate the application UI. Text, fields, and buttons use larger fonts for readability. Use the **Theme** dropdown to choose **Auto** (follow Windows), **Light**, or **Dark**; the selected color scheme updates text, backgrounds, inputs, and dropdown lists together.
 
+Choose **Clear previous application** to remove the current local draft, selected document paths, parsed address, and machine rows before preparing another application. It preserves saved accounts and the signed-in Chromium session. It does not cancel or erase a portal application already in progress or one already submitted.
+
 The main window opens at a screen-aware size. Its content expands to the available width, wraps long status messages, and reflows machine details from a wide table into 5-, 3-, or 2-column layouts as the window narrows. The vertical scrollbar remains available at every size.
 
 ## Limits
