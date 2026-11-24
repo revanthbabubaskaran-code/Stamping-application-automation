@@ -234,7 +234,8 @@ def read_certificate_pages(path: str) -> tuple[int, list[dict]]:
             # Table extraction is the expensive part for long certificates.
             # Skip it on pages that cannot contain an instrument record while
             # retaining text extraction for page numbering and header fields.
-            machine_page = bool(re.search(
+            is_stamping_transcription = bool(re.search(r"CERTIFICATE\s+DATA\s+TRANSCRIPTION", text, re.I))
+            machine_page = is_stamping_transcription or bool(re.search(
                 r"machine\s*(?:no\.?|number)|make\s*:|max\s*:|min\s*:|\be\s*/\s*d\s*:|"
                 r"denomination|verification\s+fee|iron\s+hexagonal|weights\s+and\s+parallelepiped",
                 text, re.I,
@@ -4162,7 +4163,7 @@ class App(tk.Tk):
             self.profile = load_vault()
         except Exception as e:
             self._show_copyable_error("Profile could not be opened", f"Encrypted profile could not be read. It may belong to another Windows user.\n\n{e}")
-        self.files = {"certificate": "", "authorization": "", "address_source": ""}
+        self.files = {"certificate": "", "authorization": "", "address_source": "", "portal_upload": ""}
         self.file_buttons = {}
         self.vars = {}
         self.machine_rows = []
@@ -4503,7 +4504,7 @@ class App(tk.Tk):
         self.theme_selector = ttk.Combobox(header, textvariable=self.theme_mode_var, values=("Auto", "Light", "Dark"), state="readonly", width=10)
         self.theme_selector.pack(side="right")
         self.theme_selector.bind("<<ComboboxSelected>>", self._on_theme_selected)
-        ttk.Label(outer, text="Read a previous certificate, prepare the stamping form, and review before submission.", style="Sub.TLabel").pack(anchor="w", pady=(2, 16))
+        ttk.Label(outer, text="Read a Previous CV or stamping input transcription, prepare the stamping form, and review before submission.", style="Sub.TLabel").pack(anchor="w", pady=(2, 16))
         canvas = tk.Canvas(outer, bg=self.palette["bg"], highlightthickness=0)
         scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
         body = ttk.Frame(canvas)
@@ -4532,8 +4533,27 @@ class App(tk.Tk):
         ttk.Button(row, text="Edit credentials", command=self.edit_account).pack(side="left", padx=(8, 0))
 
         docs = self._card(body, "Documents")
-        self._file_row(docs, "Purchase invoice / Previous CV (PDF)", "certificate", ("PDF files", "*.pdf"))
+        self._file_row(
+            docs,
+            "PDF to read machine data (Previous CV or stamping input transcription)",
+            "certificate",
+            ("PDF files", "*.pdf"),
+        )
         self._file_row(docs, "Authorisation letter from user / owner", "authorization", ("PDF or image", "*.pdf *.jpg *.jpeg *.png"))
+        self.use_separate_upload_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            docs,
+            text="Upload a different PDF to the portal than the machine data PDF",
+            variable=self.use_separate_upload_var,
+            command=self._on_portal_upload_changed,
+        ).pack(anchor="w", pady=(10, 0))
+        self._file_row(
+            docs,
+            "PDF to upload as purchase invoice / Previous CV",
+            "portal_upload",
+            ("PDF files", "*.pdf"),
+            enabled=False,
+        )
         self.use_different_address_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             docs, text="Use different address", variable=self.use_different_address_var,
@@ -4643,6 +4663,11 @@ class App(tk.Tk):
         button.pack(side="right")
         self.file_buttons[key] = button
 
+    def _portal_upload_path(self):
+        if self.use_separate_upload_var.get():
+            return self.files.get("portal_upload", "")
+        return self.files.get("certificate", "")
+
     def _on_address_source_changed(self):
         enabled = bool(self.use_different_address_var.get())
         button = self.file_buttons.get("address_source")
@@ -4656,6 +4681,21 @@ class App(tk.Tk):
         else:
             self.status.set("Address source changed. Select Read PDF and fill draft to refresh the address values.")
 
+    def _on_portal_upload_changed(self):
+        enabled = bool(self.use_separate_upload_var.get())
+        button = self.file_buttons.get("portal_upload")
+        if button is not None:
+            button.configure(state="normal" if enabled else "disabled")
+        if hasattr(self, "draft_confirmed"):
+            self.draft_confirmed.set(False)
+            self.draft_confirmation_status.set("Portal upload selection changed; review and confirm the draft again.")
+        if enabled and not self.files.get("portal_upload"):
+            self.status.set("Choose the separate PDF that the portal should receive, then review and confirm the draft.")
+        elif enabled:
+            self.status.set("The selected separate PDF will be uploaded in the portal's Previous CV / invoice field.")
+        else:
+            self.status.set("The machine data PDF will also be uploaded in the portal.")
+
     def choose_file(self, key, file_filter):
         path = filedialog.askopenfilename(filetypes=[file_filter, ("All files", "*.*")])
         if path:
@@ -4663,6 +4703,8 @@ class App(tk.Tk):
             self.files[key + "_display"].set(Path(path).name)
             if key == "address_source":
                 self._on_address_source_changed()
+            elif key == "portal_upload":
+                self._on_portal_upload_changed()
 
     def _set_fields(self, values, machine_data=None):
         for frame in (self.first_page_field_frame, self.machine_field_frame):
@@ -4734,9 +4776,11 @@ class App(tk.Tk):
             return
         self._pdf_read_generation += 1
         self._pdf_reading = False
-        for key in ("certificate", "authorization", "address_source"):
+        for key in ("certificate", "authorization", "address_source", "portal_upload"):
             self.files[key] = ""
             self.files[key + "_display"].set("No file selected")
+        self.use_separate_upload_var.set(False)
+        self._on_portal_upload_changed()
         self.use_different_address_var.set(False)
         self._on_address_source_changed()
         self.read_pdf_button.configure(state="normal")
@@ -4908,9 +4952,15 @@ class App(tk.Tk):
         else:
             self._set_fields(values, machines)
         ignored = page_count - meaningful_page_count
-        address_note = f" Address fields read from {Path(address_path).name}." if address_path else " Address fields read from the Previous CV PDF."
+        address_note = f" Address fields read from {Path(address_path).name}." if address_path else " Address fields read from the machine data PDF."
+        portal_upload_path = self._portal_upload_path()
+        upload_note = (
+            f" Portal upload uses {Path(portal_upload_path).name}."
+            if portal_upload_path and portal_upload_path != path
+            else " The machine data PDF will also be uploaded to the portal."
+        )
         split_note = f" Split into {len(self.application_part_states)} application parts; review each part separately." if len(self.application_part_states) > 1 else ""
-        self.status.set(f"Draft read from {Path(path).name}: {page_count} pages, {len(machines)} machine(s), {ignored} blank/footer page(s) ignored.{split_note}{address_note} Review every value before filling the portal.")
+        self.status.set(f"Machine data read from {Path(path).name}: {page_count} pages, {len(machines)} machine(s), {ignored} blank/footer page(s) ignored.{split_note}{address_note}{upload_note} Review every value before filling the portal.")
 
     def _create_application_parts(self, values, machines):
         sizes = plan_machine_parts(len(machines))
@@ -5342,7 +5392,14 @@ class App(tk.Tk):
             group = grouped.setdefault(key, {"description": description, "quantity": 0, "machines": []})
             group["quantity"] += _item_count(row.get("Quantity", ""))
             group["machines"].append(row)
-        return {"fields": fields, "machine_rows": machine_rows, "item_groups": list(grouped.values()), "certificate": self.files.get("certificate"), "authorization": self.files.get("authorization"), "pan_image_data": image_payload}
+        return {
+            "fields": fields,
+            "machine_rows": machine_rows,
+            "item_groups": list(grouped.values()),
+            "certificate": self._portal_upload_path(),
+            "authorization": self.files.get("authorization"),
+            "pan_image_data": image_payload,
+        }
 
     def submit_application(self):
         if not self.worker or not self.worker.is_alive():
@@ -5373,6 +5430,12 @@ class App(tk.Tk):
         if not self.files.get("certificate") or not self.machine_rows:
             messagebox.showerror("Read the PDF first", "Choose the certificate, then select Read PDF and fill draft before confirming.")
             return
+        if self.use_separate_upload_var.get() and not self.files.get("portal_upload"):
+            messagebox.showerror(
+                "Portal upload PDF required",
+                "Choose the separate PDF that should be uploaded to the portal, or turn off the separate-upload option.",
+            )
+            return
         place = self.stamping_place_var.get().strip().casefold()
         if place not in {"office", "site"}:
             messagebox.showerror("Choose Office or Site", "Select whether this application is for Office or Site stamping before confirming the draft.")
@@ -5389,6 +5452,13 @@ class App(tk.Tk):
         if not self.draft_confirmed.get():
             if show_error:
                 messagebox.showerror("Confirm the draft first", "Review the PDF values and select the confirmation box before starting or filling the application.")
+            return False
+        if self.use_separate_upload_var.get() and not self.files.get("portal_upload"):
+            if show_error:
+                messagebox.showerror(
+                    "Portal upload PDF required",
+                    "Choose the separate PDF that should be uploaded to the portal, or turn off the separate-upload option.",
+                )
             return False
         place = self.stamping_place_var.get().strip().casefold()
         if place not in {"office", "site"}:
