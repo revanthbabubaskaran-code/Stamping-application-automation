@@ -533,6 +533,16 @@ def extract_address_document(path: str) -> dict[str, str]:
     if not text.strip():
         raise RuntimeError("No selectable text was found in the address PDF. Use a text-searchable PDF.")
     fields = _extract_address_fields(text)
+    # When an alternate address PDF is selected, its M/S establishment line
+    # is the source of the applicant name as well as the address. Flatten line
+    # wraps so names split across PDF text lines remain intact.
+    flat_text = re.sub(r"\s+", " ", text)
+    applicant_name = first(
+        r"(?:belonging\s+to\s+)?M/S\.?\s+(.+?)(?=,\s*Locality\b)",
+        flat_text,
+    )
+    if applicant_name:
+        fields["Applicant / establishment name"] = applicant_name
     if not any(fields.get(key) for key in ("Business address", "District", "Taluk", "Town / Village", "Pincode")):
         raise RuntimeError("No recognizable address was found. Use a PDF containing an address or locality with its PIN code.")
     return fields
