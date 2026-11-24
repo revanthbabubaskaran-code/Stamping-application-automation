@@ -6,6 +6,7 @@ performed in the Chromium browser bundled with the app using Playwright.
 from __future__ import annotations
 
 import base64
+import copy
 import ctypes
 import json
 import math
@@ -4164,6 +4165,7 @@ class App(tk.Tk):
         except Exception as e:
             self._show_copyable_error("Profile could not be opened", f"Encrypted profile could not be read. It may belong to another Windows user.\n\n{e}")
         self.files = {"certificate": "", "authorization": "", "address_source": "", "portal_upload": ""}
+        self.confirmed_application_payloads = []
         self.file_buttons = {}
         self.vars = {}
         self.machine_rows = []
@@ -4674,6 +4676,7 @@ class App(tk.Tk):
         if button is not None:
             button.configure(state="normal" if enabled else "disabled")
         if hasattr(self, "draft_confirmed"):
+            self.confirmed_application_payloads = []
             self.draft_confirmed.set(False)
             self.draft_confirmation_status.set("Address source changed; reread and confirm the draft.")
         if enabled and not self.files.get("address_source"):
@@ -4686,6 +4689,8 @@ class App(tk.Tk):
         button = self.file_buttons.get("portal_upload")
         if button is not None:
             button.configure(state="normal" if enabled else "disabled")
+        self.confirmed_application_payloads = []
+        self._refresh_previous_cv_details_visibility()
         if hasattr(self, "draft_confirmed"):
             self.draft_confirmed.set(False)
             self.draft_confirmation_status.set("Portal upload selection changed; review and confirm the draft again.")
@@ -4712,6 +4717,7 @@ class App(tk.Tk):
         self.vars.clear()
         self.machine_rows = []
         self.machine_metadata = []
+        self.confirmed_application_payloads = []
         if hasattr(self, "draft_confirmed"):
             self.draft_confirmed.set(False)
             if hasattr(self, "draft_confirmation_status"):
@@ -4726,18 +4732,21 @@ class App(tk.Tk):
                 detected = str(values.get("Dormant / Other", "")).strip().title()
                 self.site_status_var.set(detected if detected in {"Dormant", "Other"} else "Select")
             self._sync_site_choice()
-        first_idx = 0
         machine_keys = [
             "Weights", "Instrument description", "Instrument make", "Maximum capacity", "Minimum capacity",
             "Verification interval (e/d)", "Instrument model", "Machine number", "Class", "Quantity",
+            "Previous CV number", "Previous CV date", "Application number",
         ]
         machine_headers = {
             "Weights": "Weights", "Instrument description": "Instrument type", "Instrument make": "Make",
             "Maximum capacity": "Max", "Minimum capacity": "Min",
             "Verification interval (e/d)": "e/d", "Instrument model": "Model",
             "Machine number": "Machine number", "Class": "Class", "Quantity": "Qty",
+            "Previous CV number": "Previous CV number", "Previous CV date": "Previous CV date",
+            "Application number": "Application number",
         }
-        self.machine_display_keys = machine_keys
+        self.machine_all_display_keys = machine_keys
+        self.machine_display_keys = self._visible_machine_display_keys()
         self.machine_display_headers = machine_headers
         records = machine_data or [{name: values.get(name, "") for name in machine_keys}]
         for machine_index, record in enumerate(records):
@@ -4753,18 +4762,60 @@ class App(tk.Tk):
         for name in FIELD_LABELS:
             if name in MACHINE_REVIEW_FIELDS:
                 continue
-            frame = self.first_page_field_frame
-            idx = first_idx
-            var = tk.StringVar(value=values.get(name, ""))
-            self.vars[name] = var
-            ttk.Label(frame, text=name, style="Card.TLabel").grid(row=idx, column=0, sticky="w", pady=3, padx=(0, 10))
-            ttk.Entry(frame, textvariable=var, width=48).grid(row=idx, column=1, sticky="ew", pady=3)
-            first_idx += 1
-        self.first_page_field_frame.columnconfigure(1, weight=1)
+            self.vars[name] = tk.StringVar(value=values.get(name, ""))
+        self._render_first_page_fields()
         if self.pan_name.get(): self.vars["PAN name"].set(self.pan_name.get())
         if self.pan_number.get(): self.vars["PAN number"].set(self.pan_number.get())
         if self.pan_date.get(): self.vars["PAN date"].set(self.pan_date.get())
         if self.license_number.get(): self.vars["Repairer licence number"].set(self.license_number.get())
+
+    def _show_previous_cv_details(self):
+        return bool(
+            hasattr(self, "use_separate_upload_var")
+            and self.use_separate_upload_var.get()
+            and self.files.get("portal_upload")
+        )
+
+    def _visible_machine_display_keys(self):
+        keys = list(getattr(self, "machine_all_display_keys", []))
+        if not self._show_previous_cv_details():
+            hidden = {"Previous CV number", "Previous CV date", "Application number"}
+            keys = [key for key in keys if key not in hidden]
+        return keys
+
+    def _refresh_previous_cv_details_visibility(self):
+        if not hasattr(self, "machine_all_display_keys"):
+            return
+        self.machine_display_keys = self._visible_machine_display_keys()
+        self._render_first_page_fields()
+        self._render_machine_fields()
+
+    def _render_first_page_fields(self):
+        if not hasattr(self, "first_page_field_frame"):
+            return
+        for widget in self.first_page_field_frame.winfo_children():
+            widget.destroy()
+        row = 0
+        hidden_cv_fields = {"Previous CV number", "Previous CV date"}
+        for name in FIELD_LABELS:
+            if name in MACHINE_REVIEW_FIELDS or name not in self.vars:
+                continue
+            if name in hidden_cv_fields and not self._show_previous_cv_details():
+                continue
+            ttk.Label(self.first_page_field_frame, text=name, style="Card.TLabel").grid(
+                row=row, column=0, sticky="w", pady=3, padx=(0, 10)
+            )
+            entry = ttk.Entry(self.first_page_field_frame, textvariable=self.vars[name], width=48)
+            entry.grid(row=row, column=1, sticky="ew", pady=3)
+            entry.bind("<KeyRelease>", self._on_draft_field_edited, add="+")
+            row += 1
+        self.first_page_field_frame.columnconfigure(1, weight=1)
+
+    def _on_draft_field_edited(self, _event=None):
+        if getattr(self, "draft_confirmed", None) and self.draft_confirmed.get():
+            self.draft_confirmed.set(False)
+            self.confirmed_application_payloads = []
+            self.draft_confirmation_status.set("Draft values changed. Confirm the edited draft again before filling.")
 
     def clear_previous_application(self):
         if not messagebox.askyesno(
@@ -4789,6 +4840,7 @@ class App(tk.Tk):
         self.site_status_var.set("Select")
         self._sync_site_choice()
         self.application_part_states = []
+        self.confirmed_application_payloads = []
         self.active_application_part = 0
         self.application_part_var.set("Part 1 of 1")
         self.application_part_combo.configure(values=("Part 1 of 1",))
@@ -4820,23 +4872,23 @@ class App(tk.Tk):
             for machine_index, row_vars in enumerate(self.machine_rows):
                 label_row = 1 + machine_index * 2
                 field_row = label_row + 1
-                metadata = self.machine_metadata[machine_index] if machine_index < len(self.machine_metadata) else {}
                 machine_type = row_vars.get("Instrument description").get() if row_vars.get("Instrument description") else ""
-                certificate_no = metadata.get("Previous CV number", "")
+                certificate_no = row_vars.get("Previous CV number").get() if row_vars.get("Previous CV number") else ""
                 title = f"Machine {machine_index + 1}" + (f" — {machine_type}" if machine_type else "")
                 if certificate_no:
                     title += f" (CV {certificate_no})"
                 ttk.Label(self.machine_field_frame, text=title, style="Muted.Card.TLabel", wraplength=max(500, self.winfo_width() - 100), justify="left").grid(row=label_row, column=0, columnspan=columns, sticky="w", padx=3, pady=(8, 1))
                 for col, name in enumerate(keys):
-                    ttk.Entry(self.machine_field_frame, textvariable=row_vars[name], width=11).grid(row=field_row, column=col, sticky="ew", padx=3, pady=3)
+                    entry = ttk.Entry(self.machine_field_frame, textvariable=row_vars[name], width=11)
+                    entry.grid(row=field_row, column=col, sticky="ew", padx=3, pady=3)
+                    entry.bind("<KeyRelease>", self._on_draft_field_edited, add="+")
             return
 
         rows_per_machine = math.ceil(len(keys) / columns) * 2 + 1
         for machine_index, row_vars in enumerate(self.machine_rows):
             base_row = machine_index * rows_per_machine
-            metadata = self.machine_metadata[machine_index] if machine_index < len(self.machine_metadata) else {}
             machine_type = row_vars.get("Instrument description").get() if row_vars.get("Instrument description") else ""
-            certificate_no = metadata.get("Previous CV number", "")
+            certificate_no = row_vars.get("Previous CV number").get() if row_vars.get("Previous CV number") else ""
             title = f"Machine {machine_index + 1}" + (f" — {machine_type}" if machine_type else "")
             if certificate_no:
                 title += f" (CV {certificate_no})"
@@ -4846,7 +4898,9 @@ class App(tk.Tk):
                 col = index % columns
                 cell_width = max(160, int((self.winfo_width() - 100) / columns))
                 ttk.Label(self.machine_field_frame, text=headers.get(name, name), style="Card.TLabel", wraplength=cell_width - 12).grid(row=base_row + row_offset, column=col, sticky="w", padx=3, pady=(3, 0))
-                ttk.Entry(self.machine_field_frame, textvariable=row_vars[name], width=14).grid(row=base_row + row_offset + 1, column=col, sticky="ew", padx=3, pady=(0, 4))
+                entry = ttk.Entry(self.machine_field_frame, textvariable=row_vars[name], width=14)
+                entry.grid(row=base_row + row_offset + 1, column=col, sticky="ew", padx=3, pady=(0, 4))
+                entry.bind("<KeyRelease>", self._on_draft_field_edited, add="+")
 
     def read_pdf(self):
         path = self.files.get("certificate")
@@ -5008,6 +5062,8 @@ class App(tk.Tk):
         if selected < 0 or selected >= len(self.application_part_states) or selected == self.active_application_part:
             return
         self._store_active_application_part()
+        self.confirmed_application_payloads = []
+        self.draft_confirmed.set(False)
         self.active_application_part = selected
         state = self.application_part_states[selected]
         self._set_fields(state["fields"], state["machines"])
@@ -5227,7 +5283,7 @@ class App(tk.Tk):
             if self.worker and self.worker.is_alive() and self.account_combo.current() == match_index:
                 self.worker.send("credentials", {
                     "credentials": {"username": email, "password": password},
-                    "application": self._application_payload(),
+                    "application": self._payload_for_fill() if self._validate_draft_confirmation(show_error=False) else None,
                 })
             window.destroy()
 
@@ -5245,7 +5301,7 @@ class App(tk.Tk):
         if has_draft and not self._validate_draft_confirmation():
             return
         try:
-            self.worker.send("open", {"credentials": {"username": self.user_var.get(), "password": self.pass_var.get()}, "application": self._application_payload() if has_draft else None})
+            self.worker.send("open", {"credentials": {"username": self.user_var.get(), "password": self.pass_var.get()}, "application": self._payload_for_fill() if has_draft else None})
             self.status.set("Opening bundled Chromium and filling saved sign-in. Enter the CAPTCHA in that window; a reviewed PDF draft will continue automatically after login." if has_draft else "Opening bundled Chromium and filling saved sign-in. Enter the CAPTCHA there. Read the PDF draft, then choose Fill now / retry after login.")
         except Exception as exc:
             self.status.set(f"Could not start Chromium: {exc}")
@@ -5265,7 +5321,7 @@ class App(tk.Tk):
         if not self._validate_draft_confirmation():
             return
         self._ensure_worker()
-        payload = self._application_payload()
+        payload = self._payload_for_fill()
         payload["credentials"] = {"username": self.user_var.get(), "password": self.pass_var.get()}
         try:
             self.worker.send("fill", payload)
@@ -5290,7 +5346,7 @@ class App(tk.Tk):
         ):
             return
         self._ensure_worker()
-        payload = self._application_payload()
+        payload = self._payload_for_fill()
         payload["credentials"] = {"username": self.user_var.get(), "password": self.pass_var.get()}
         try:
             self.worker.send("new_application", payload)
@@ -5318,7 +5374,7 @@ class App(tk.Tk):
         ):
             return
         try:
-            applications = [self._application_payload(index) for index in range(len(self.application_part_states))]
+            applications = [self._payload_for_fill(index) for index in range(len(self.application_part_states))]
             self._ensure_worker()
             self.worker.send("apply_all_parts", {
                 "applications": applications,
@@ -5347,30 +5403,24 @@ class App(tk.Tk):
                 source_machine_rows.append(item)
         fields["Stamping office/site"] = self.stamping_place_var.get().strip()
         fields["Dormant / Other"] = self.site_status_var.get().strip() if fields["Stamping office/site"].casefold() == "site" else ""
-        # The portal's establishment name is the company name parsed/reviewed
-        # from the certificate. PAN identity and repairer identity are separate.
-        # The PDF's M/S line is the source of truth for the establishment
-        # name; don't let a stale secondary entry replace it (for example with
-        # the state value copied by the portal's same-details checkbox).
-        company_name = fields.get("Applicant / establishment name", "").strip() or fields.get("Applicant business name", "").strip()
-        if company_name:
-            fields["Applicant business name"] = company_name
-            fields["Applicant / establishment name"] = company_name
+        # Keep edited applicant and establishment names independently. The
+        # parser initially seeds both from the certificate/address PDF, while
+        # the draft editor may intentionally correct either one.
         fields["PAN name"] = fields.get("PAN name", "") or self.pan_name.get().strip()
         fields["PAN number"] = fields.get("PAN number", "") or self.pan_number.get().strip()
         fields["PAN date"] = fields.get("PAN date", "") or self.pan_date.get().strip()
-        fields["Repairer licence number"] = self.license_number.get().strip() or fields.get("Repairer licence number", "")
-        fields["Repairer name"] = self.pan_name.get().strip() or fields.get("Repairer name", "")
+        fields["Repairer licence number"] = fields.get("Repairer licence number", "").strip() or self.license_number.get().strip()
+        fields["Repairer name"] = fields.get("Repairer name", "").strip() or self.pan_name.get().strip()
         fields["Applicant contact name"] = fields.get("Applicant contact name", "") or self.contact_var.get().strip()
         fields["Registered name"] = fields.get("Registered name", "") or self.contact_var.get().strip()
-        fields["Registered email"] = self.user_var.get().strip() or fields.get("Registered email", "")
+        fields["Registered email"] = fields.get("Registered email", "").strip() or self.user_var.get().strip()
         fields["Registered mobile"] = fields.get("Registered mobile", "") or self.mobile_var.get().strip()
         account_index = self.account_combo.current()
         account = self.accounts[account_index] if 0 <= account_index < len(self.accounts) else {}
         repairer_company = account.get("repairer_company_name", "").strip() or fields.get("Repairer business name", "").strip()
         repairer_mobile = account.get("repairer_mobile", "").strip() or fields.get("Repairer mobile", "").strip()
         repairer_contact = ", ".join(part for part in (repairer_company, repairer_mobile) if part)
-        fields["Used by / trader contact"] = repairer_contact or self.repairer_establishment_var.get().strip() or fields.get("Used by / trader contact", "")
+        fields["Used by / trader contact"] = fields.get("Used by / trader contact", "").strip() or repairer_contact or self.repairer_establishment_var.get().strip()
         image_payload = None
         account_index = self.account_combo.current()
         account = self.accounts[account_index] if 0 <= account_index < len(self.accounts) else {}
@@ -5422,6 +5472,7 @@ class App(tk.Tk):
             self.site_status_var.set("Select")
 
     def _on_application_choice_changed(self, _event=None):
+        self.confirmed_application_payloads = []
         self.draft_confirmed.set(False)
         self.draft_confirmation_status.set("Choices changed; confirm the draft again.")
         self._sync_site_choice()
@@ -5445,11 +5496,32 @@ class App(tk.Tk):
             return
         if not messagebox.askyesno("Confirm application draft", "Have you reviewed the PDF values, machine details, stamping location, and site Dormant/Other choice? Confirm only when the draft is ready to fill the portal."):
             return
+        try:
+            self._store_active_application_part()
+            if self.application_part_states:
+                self.confirmed_application_payloads = [
+                    self._application_payload(index)
+                    for index in range(len(self.application_part_states))
+                ]
+            else:
+                self.confirmed_application_payloads = [self._application_payload()]
+        except Exception as exc:
+            self.confirmed_application_payloads = []
+            self._show_copyable_error("Could not save the reviewed draft", str(exc))
+            return
         self.draft_confirmed.set(True)
-        self.draft_confirmation_status.set("Draft confirmed. You can start or resume filling.")
+        self.draft_confirmation_status.set("Reviewed edits saved. Form filling will use this confirmed draft.")
+
+    def _payload_for_fill(self, part_index=None):
+        if not self.draft_confirmed.get() or not self.confirmed_application_payloads:
+            raise RuntimeError("Confirm the reviewed draft before building a portal payload.")
+        index = self.active_application_part if part_index is None else part_index
+        if index < 0 or index >= len(self.confirmed_application_payloads):
+            raise IndexError("The confirmed application part is invalid.")
+        return copy.deepcopy(self.confirmed_application_payloads[index])
 
     def _validate_draft_confirmation(self, show_error=True):
-        if not self.draft_confirmed.get():
+        if not self.draft_confirmed.get() or not self.confirmed_application_payloads:
             if show_error:
                 messagebox.showerror("Confirm the draft first", "Review the PDF values and select the confirmation box before starting or filling the application.")
             return False
